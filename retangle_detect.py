@@ -1,8 +1,21 @@
 import cv2
+import time
 import numpy as np
+import serial
 
 MEAN_INNER_VAL = 100
 MEAN_BORDER_VAL = 80
+
+last_dx = 100
+last_dy = 100
+
+is_tarking = False
+track_cnt = 0
+
+ser = serial.Serial(
+    port='/dev/serial/by-id/usb-ATK_ATK-HSWL-CMSIS-DAP_ATK_20190528-if00', # 串口设备名称
+    baudrate=115200, # 波特率
+)
 
 def order_points(pts):
     # initialzie a list of coordinates that will be ordered
@@ -105,6 +118,7 @@ def find_a4_paper(frame):
                 break # 找到了
 
     # 在原始帧上绘制检测到的矩形
+    global last_dx, last_dy
     if detected_rect is not None:
         cv2.drawContours(frame, [detected_rect], -1, (0, 255, 0), 3)
         # 添加文本
@@ -168,7 +182,7 @@ def find_a4_paper(frame):
 
         # 在变换后的图像中心画圆
         center_px = (maxWidth // 2, maxHeight // 2)
-        cv2.circle(warped, center_px, radius_px, (255, 0, 0), 1) # 蓝色，粗细为3
+        cv2.circle(warped, center_px, radius_px, (255, 0, 0), 1) 
 
         # --- 在原图上画出变换后的圆 ---
         # 使用逆变换矩阵
@@ -207,6 +221,44 @@ def find_a4_paper(frame):
         center_x, center_y = int(original_center[0]), int(original_center[1])
         cv2.circle(frame, (center_x, center_y), 1, (0, 0, 255), -1)
         cv2.putText(frame, "Center", (center_x - 30, center_y - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
+
+        # 计算屏幕中心点到圆心的距离
+        screen_center_x = frame.shape[1] // 2 +20
+        screen_center_y = frame.shape[0] // 2 -13
+        dx = center_x - screen_center_x
+        dy = center_y - screen_center_y
+        distance_to_center = np.sqrt(dx**2 + dy**2)
+        
+        # 在屏幕上标记屏幕中心点
+        cv2.circle(frame, (screen_center_x, screen_center_y), 3, (0, 255, 255), -1)
+        cv2.putText(frame, "Screen Center", (screen_center_x - 50, screen_center_y - 10), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+        
+        if abs(dx) + abs(dy) < 6 and abs(last_dx) + abs(last_dy) < 6 :
+            # 如果dx和dy都很小，认为已经对准
+            cv2.putText(frame, "Aligned", (screen_center_x - 50, screen_center_y + 20), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+            global is_tarking, track_cnt
+            if not is_tarking:
+                track_cnt += 1
+                if track_cnt > 5:
+                    is_tarking = True
+                    track_cnt = 0
+                    time.sleep(0.01) 
+                    ser.write(b"1\n")
+                    time.sleep(0.01)
+        else:
+            is_tarking = False
+            track_cnt = 0
+
+        last_dx = dx
+        last_dy = dy
+        # 打印距离信息
+        print(f"{-dx},{dy}")
+        ser.write(f"{-dx},{dy}\n".encode())
+        # 在图像上显示距离信息
+        # cv2.putText(frame, f"dx:{dx}, dy:{dy}", (10, 30), 
+        #            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
 
     return frame, warped_image
