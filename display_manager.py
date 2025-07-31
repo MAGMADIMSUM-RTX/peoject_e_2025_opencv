@@ -9,6 +9,7 @@ class DisplayManager:
     def __init__(self):
         self.transformed_view = np.zeros((100, 100, 3), np.uint8)
         self.display_enabled = config.ENABLE_DISPLAY
+        print(f"配置中的 ENABLE_DISPLAY: {self.display_enabled}")
         
         # 检测是否在SSH环境下
         self.is_ssh = 'SSH_CLIENT' in os.environ or 'SSH_TTY' in os.environ or os.environ.get('DISPLAY', '') == ''
@@ -16,6 +17,10 @@ class DisplayManager:
         if self.is_ssh and self.display_enabled:
             print("检测到SSH环境，将禁用图像显示窗口")
             self.display_enabled = False
+        elif self.display_enabled:
+            print("显示功能已启用")
+        else:
+            print("显示功能已禁用")
     
     def draw_detection_info(self, frame, detected_rect, center_x, center_y):
         """绘制检测信息"""

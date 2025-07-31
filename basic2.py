@@ -14,6 +14,9 @@ from distance_calculator import SimpleDistanceCalculator
 from a4_detector import A4PaperDetector
 from display_manager import DisplayManager
 
+dx_from_uart = 0
+dy_from_uart = 0  # 用于从串口接收偏移量
+
 class A4TrackingSystem:
     """A4纸跟踪系统主类"""
     
@@ -30,10 +33,38 @@ class A4TrackingSystem:
         
         # 摄像头
         self.cap = None
+        
+        # 校准点收集
+        self.calibration_points = []  # 存储校准点 [distance_mm, offset_x, offset_y]
+        self.max_calibration_points = 3  # 最大收集3个校准点
 
     def set_fix_gap(self, fix_gap):
         """设置是否修正误差"""
         self.fix_gap = fix_gap
+    
+    def update_calibration_points(self):
+        """更新配置文件中的校准点"""
+        try:
+            # 更新动态配置
+            config.CALIBRATION_POINTS = self.calibration_points.copy()
+            
+            # 保存到文件
+            config.save_to_file()
+            
+            print("=== 校准点更新完成 ===")
+            for i, point in enumerate(self.calibration_points, 1):
+                print(f"校准点{i}: 距离={point[0]}mm, 偏移=({point[1]}, {point[2]})")
+            
+            # 重新初始化偏移计算器以使用新的校准点
+            self.offset_calculator = DistanceOffsetCalculator()
+            print("偏移计算器已重新初始化")
+            
+            # 清空校准点列表，准备下一轮收集
+            self.calibration_points = []
+            print("校准点列表已清空，可以开始新一轮校准")
+            
+        except Exception as e:
+            print(f"更新校准点失败: {e}")
         
     def initialize_camera(self, camera_index=0):
         """初始化摄像头"""
@@ -68,20 +99,51 @@ class A4TrackingSystem:
         avg_distance = self.distance_calculator.get_averaged_distance()
         
         if self.fix_gap:
+            # debug 时，使用串口，手动修正间隙
+            global dx_from_uart, dy_from_uart
+            
+            # 读取以0xA5 0x5A结束的数据包
+            packet = self.hmi.read_packet_with_terminator(timeout=0)
+            if packet:
+                result, message = self.hmi.parse_packet_data(packet)
+                print(f"收到数据包: {message}")
+                
+                if result == 'quit':
+                    print("收到退出命令，程序即将退出...")
+                    return frame, None, None, "quit"
+                
+                elif result == 'ok':
+                    # 收集校准点数据
+                    if distance_mm and len(self.calibration_points) < self.max_calibration_points:
+                        # 将数据转换为整数并存储
+                        calibration_point = [int(distance_mm), int(dx_from_uart), int(dy_from_uart)]
+                        self.calibration_points.append(calibration_point)
+                        print(f"收集校准点 {len(self.calibration_points)}/{self.max_calibration_points}: {calibration_point}")
+                        
+                        # 如果收集到3个校准点，更新配置文件
+                        if len(self.calibration_points) == self.max_calibration_points:
+                            self.update_calibration_points()
+                    else:
+                        if not distance_mm:
+                            print("错误: 距离数据无效，无法收集校准点")
+                        else:
+                            print(f"已收集足够的校准点({self.max_calibration_points}个)")
+                
+                elif isinstance(result, tuple):
+                    # 坐标数据
+                    x, y = result
+                    dx_from_uart = x
+                    dy_from_uart = y
+                    print(f"更新偏移量: dx={dx_from_uart}, dy={dy_from_uart}")
+            
+            offset_x, offset_y = dx_from_uart, dy_from_uart
+        else:
             # 计算屏幕中心偏移
             if avg_distance:
                 offset_x, offset_y = self.offset_calculator.calculate_screen_center_offset(avg_distance)
             else:
                 offset_x, offset_y = 0, 0
             
-        else:
-            # debug 时，使用串口，手动修正间隙
-            offset_x, offset_y = 0, 0
-
-        
-        msg=self.hmi.read_line()
-        print("收到串口数据：", msg)
-
         # 计算动态屏幕中心
         screen_center_x = frame.shape[1] // 2 + offset_x
         screen_center_y = frame.shape[0] // 2 + offset_y
@@ -129,6 +191,11 @@ class A4TrackingSystem:
             
             # 处理帧
             processed_frame, warped_image, distance, avg_distance = self.process_frame(frame)
+            
+            # 检查是否收到串口退出命令
+            if avg_distance == "quit":
+                print("收到串口退出命令，程序退出")
+                break
             
             # 显示结果
             self.display_manager.show_frames(processed_frame)

@@ -8,14 +8,14 @@ import cv2
 import numpy as np
 
 # 导入模块化组件
-from config import *
+from dynamic_config import config
 from serial_controller import SerialController
 from distance_offset_calculator import DistanceOffsetCalculator
 from distance_calculator import SimpleDistanceCalculator
 from a4_detector import A4PaperDetector
 from display_manager import DisplayManager
 
-# from config import ENABLE_SERIAL, SERIAL_PORT, SERIAL_BAUDRATE
+# from dynamic_config import ENABLE_SERIAL, SERIAL_PORT, SERIAL_BAUDRATE
 
 
 class A4TrackingSystem:

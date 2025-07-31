@@ -171,7 +171,7 @@ python runtime_config_example.py
 支持多种读取方式：
 ```python
 # 读取完整行（推荐）
-line = serial_controller.read_line(timeout=1.0)
+line = serial_controller.read_line(timeout=0)
 
 # 逐字节读取直到\n
 data = serial_controller.read_until_newline()

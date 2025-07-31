@@ -27,7 +27,7 @@ HMI_PORT = '/dev/serial0'
 HMI_BAUDRATE = 115200
 
 # 显示控制宏定义
-ENABLE_DISPLAY = False  # 设置为 False 可以禁用所有显示功能（适用于SSH/无头模式）
+ENABLE_DISPLAY = True  # 设置为 False 可以禁用所有显示功能（适用于SSH/无头模式）
 
 # 跟踪参数
 ALIGNMENT_THRESHOLD = 6  # 对齐阈值

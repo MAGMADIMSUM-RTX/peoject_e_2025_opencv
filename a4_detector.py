@@ -149,6 +149,12 @@ class A4PaperDetector:
         # 计算中心点在原图中的位置
         center_warped_homogeneous = np.array([center_px[0], center_px[1], 1], dtype=np.float32)
         original_center_homogeneous = inv_M.dot(center_warped_homogeneous)
+        
+        # 防止除零错误
+        if abs(original_center_homogeneous[2]) < 1e-8:  # 检查是否接近零
+            print("警告: 透视变换除数接近零，使用默认中心点")
+            return center_px[0], center_px[1]  # 返回变换图像的中心点
+        
         original_center = (
             original_center_homogeneous[0] / original_center_homogeneous[2],
             original_center_homogeneous[1] / original_center_homogeneous[2]
@@ -183,7 +189,7 @@ class A4PaperDetector:
         
         # 可选：读取串口返回的数据
         if serial_controller.in_waiting() > 0:
-            response = serial_controller.read_line(timeout=0.1)
+            response = serial_controller.read_line(timeout=0)
             if response:
                 print(f"串口返回: {response}")
         

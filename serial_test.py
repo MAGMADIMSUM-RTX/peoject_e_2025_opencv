@@ -24,13 +24,13 @@ def test_serial_read():
     print("3. 检查缓冲区和读取完整数据")
     
     # 设置超时
-    serial_ctrl.set_timeout(0.5)
+    serial_ctrl.set_timeout(0)
     
     try:
         while True:
             # 方法1: 使用readline()
             print("\n--- 使用 read_line() 方法 ---")
-            line = serial_ctrl.read_line(timeout=1.0)
+            line = serial_ctrl.read_line(timeout=0)
             if line:
                 print(f"读取到行数据: '{line}'")
             else:
@@ -77,13 +77,13 @@ def interactive_serial_communication():
     print("程序会显示接收到的完整行数据")
     
     # 设置较短的超时以便快速响应
-    serial_ctrl.set_timeout(0.1)
+    serial_ctrl.set_timeout(0)
     
     try:
         while True:
             # 检查是否有输入数据
             if serial_ctrl.in_waiting() > 0:
-                received_line = serial_ctrl.read_line(timeout=0.5)
+                received_line = serial_ctrl.read_line(timeout=0)
                 if received_line:
                     print(f"接收: {received_line}")
             
@@ -116,7 +116,7 @@ def interactive_serial_communication():
                     # 等待响应
                     time.sleep(0.5)
                     if serial_ctrl.in_waiting() > 0:
-                        received_line = serial_ctrl.read_line(timeout=1.0)
+                        received_line = serial_ctrl.read_line(timeout=0)
                         if received_line:
                             print(f"接收: {received_line}")
                 

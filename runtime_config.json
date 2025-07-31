@@ -1,8 +1,8 @@
 {
   "A4_WIDTH_MM": 210.0,
   "A4_HEIGHT_MM": 297.0,
-  "MEAN_INNER_VAL": 120,
-  "MEAN_BORDER_VAL": 80,
+  "MEAN_INNER_VAL": 130,
+  "MEAN_BORDER_VAL": 90,
   "CAMERA_PARAMS": {
     "focal_length_mm": 2.8,
     "sensor_width_mm": 5.37,
@@ -13,9 +13,9 @@
   "SERIAL_PORT": "/dev/serial/by-id/usb-ATK_ATK-HSWL-CMSIS-DAP_ATK_20190528-if00",
   "SERIAL_BAUDRATE": 115200,
   "ENABLE_HMI": true,
-  "HMI_PORT": "/dev/serial0",
+  "HMI_PORT": "/dev/serial/by-id/usb-Arm_DAPLink_CMSIS-DAP_52D9DC36C41C91B341B13A63F8731D01-if01",
   "HMI_BAUDRATE": 115200,
-  "ENABLE_DISPLAY": false,
+  "ENABLE_DISPLAY": true,
   "ALIGNMENT_THRESHOLD": 6,
   "TRACK_COUNT_THRESHOLD": 4,
   "MAX_DISTANCE_HISTORY": 5,
@@ -43,19 +43,19 @@
   ],
   "CALIBRATION_POINTS": [
     [
-      600,
+      670,
+      -13,
+      -20
+    ],
+    [
+      1018,
       -3,
-      0
+      -22
     ],
     [
-      1000,
-      12,
-      -3
-    ],
-    [
-      1300,
-      19,
-      -5
+      1532,
+      7,
+      -21
     ]
   ]
 }

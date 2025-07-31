@@ -39,11 +39,11 @@ class DynamicConfig:
             
             # HMI串口配置
             "ENABLE_HMI": True,
-            "HMI_PORT": '/dev/serial0',
+            "HMI_PORT": '/dev/serial/by-id/usb-Arm_DAPLink_CMSIS-DAP_52D9DC36C41C91B341B13A63F8731D01-if01',
             "HMI_BAUDRATE": 115200,
             
             # 显示控制配置
-            "ENABLE_DISPLAY": False,
+            "ENABLE_DISPLAY": True,
             
             # 跟踪参数
             "ALIGNMENT_THRESHOLD": 6,
