@@ -1,488 +1,435 @@
+#!/usr/bin/env python3
+"""
+模块化A4纸跟踪系统
+主文件 - 包含主要的控制逻辑和可调参数接口
+"""
+
 import cv2
 import time
 import numpy as np
-import math
 
-# 串口控制宏定义
-ENABLE_SERIAL = True  # 设置为 False 可以禁用串口功能
+# 导入模块化组件
+from dynamic_config import config
+from serial_controller import SerialController
+from distance_offset_calculator import DistanceOffsetCalculator
+from distance_calculator import SimpleDistanceCalculator
+from a4_detector import A4PaperDetector
+from display_manager import DisplayManager
 
-if ENABLE_SERIAL:
-    import serial
+dx_from_uart = 0
+dy_from_uart = 0  # 用于从串口接收偏移量
 
-# A4纸的实际尺寸
-A4_WIDTH_MM = 210.0
-A4_HEIGHT_MM = 297.0
+class A4TrackingSystem:
+    """A4纸跟踪系统主类"""
+    
+    def __init__(self):
+        # 初始化所有组件
+        self.serial_controller = SerialController(config.SERIAL_PORT, config.SERIAL_BAUDRATE)
+        self.hmi = SerialController(config.HMI_PORT, config.HMI_BAUDRATE)
+        self.distance_calculator = SimpleDistanceCalculator()
+        self.offset_calculator = DistanceOffsetCalculator()
+        self.a4_detector = A4PaperDetector()
+        self.display_manager = DisplayManager()
 
-# 原有的检测参数（不修改）
-MEAN_INNER_VAL = 100
-MEAN_BORDER_VAL = 80
+        self.fix_gap = False
+        
+        # 摄像头
+        self.cap = None
+        
+        # 校准点收集
+        self.calibration_points = []  # 存储校准点 [distance_mm, offset_x, offset_y]
+        self.max_calibration_points = 3  # 最大收集3个校准点
+        
+        # 未检测到矩形时的定时发送
+        self.last_no_detection_send_time = 0
+        self.no_detection_send_interval = 0.3  # 0.3秒间隔
+        
+        # 检测状态标记：一旦检测到矩形，永远保持检测状态
+        self.rect_detected_once = False
+        
+        # 用于处理检测失败时的距离计算
+        self.last_valid_distance = None
+        self.detection_failure_count = 0
 
-# 原有的跟踪参数（不修改）
-last_dx = 100
-last_dy = 100
-is_tarking = False
-track_cnt = 0
-
-# 搜索模式参数（新增）
-search_mode = True  # 初始状态为搜索模式
-target_lost_time = None  # 目标丢失开始时间
-SEARCH_DELAY_SECONDS = 10.0  # 连续丢失0.3秒后进入搜索模式
-
-# 固定的已校准距离测量参数
-CAMERA_PARAMS = {
-    "focal_length_mm": 2.8,
-    "sensor_width_mm": 5.37,
-    "sensor_height_mm": 4.04,
-    "calibration_factor": 2.0776785714285713
-}
-
-# 串口初始化（保持原有逻辑）
-ser = None
-if ENABLE_SERIAL:
-    try:
-        ser = serial.Serial(
-            port='/dev/serial/by-id/usb-ATK_ATK-HSWL-CMSIS-DAP_ATK_20190528-if00',
-            baudrate=115200,
-        )
-        print("串口已成功连接")
-    except Exception as e:
-        print(f"串口连接失败: {e}")
-        print("程序将在无串口模式下运行")
-        ENABLE_SERIAL = False
-        ser = None
-else:
-    print("串口功能已禁用")
-
-def serial_write(data):
-    """安全的串口写入函数（保持不变）"""
-    if ENABLE_SERIAL and ser is not None:
+    def set_fix_gap(self, fix_gap):
+        """设置是否修正误差"""
+        self.fix_gap = fix_gap
+    
+    def update_calibration_points(self):
+        """更新配置文件中的校准点"""
         try:
-            ser.write(data)
+            # 更新动态配置
+            config.CALIBRATION_POINTS = self.calibration_points.copy()
+            
+            # 保存到文件
+            config.save_to_file()
+            
+            print("=== 校准点更新完成 ===")
+            for i, point in enumerate(self.calibration_points, 1):
+                print(f"校准点{i}: 距离={point[0]}mm, 偏移=({point[1]}, {point[2]})")
+            
+            # 重新初始化偏移计算器以使用新的校准点
+            self.offset_calculator = DistanceOffsetCalculator()
+            print("偏移计算器已重新初始化")
+            
+            # 清空校准点列表，准备下一轮收集
+            self.calibration_points = []
+            print("校准点列表已清空，可以开始新一轮校准")
+            
         except Exception as e:
-            print(f"串口写入错误: {e}")
-
-class DistanceOffsetCalculator:
-    """基于距离的屏幕中心偏移计算器"""
-    def __init__(self):
-        # 根据提供的数据点进行多项式拟合
-        # 数据点: (距离mm, offset_x, offset_y)
-        self.calibration_points = [
-            (600, -3, 0),    # 600mm: offset_x=-3, offset_y=0
-            (1000, 12, -3),  # 1000mm: offset_x=12, offset_y=-3
-            (1300, 19, -5)   # 1300mm: offset_x=19, offset_y=-5
-        ]
+            print(f"更新校准点失败: {e}")
         
-        # 提取数据进行拟合
-        distances = [point[0] for point in self.calibration_points]
-        offset_x_values = [point[1] for point in self.calibration_points]
-        offset_y_values = [point[2] for point in self.calibration_points]
+    def initialize_camera(self, camera_index=0):
+        """初始化摄像头"""
+        self.cap = cv2.VideoCapture(camera_index)
         
-        # 使用二次多项式拟合 y = ax² + bx + c
-        self.poly_coeffs_x = np.polyfit(distances, offset_x_values, 2)
-        self.poly_coeffs_y = np.polyfit(distances, offset_y_values, 2)
+        if not self.cap.isOpened():
+            print("错误：无法打开视频流。")
+            return False
         
-        print("屏幕中心偏移拟合完成:")
-        print(f"X偏移拟合系数: {self.poly_coeffs_x}")
-        print(f"Y偏移拟合系数: {self.poly_coeffs_y}")
-        
-        # 验证拟合精度
-        print("\n验证拟合精度:")
-        for dist, expected_x, expected_y in self.calibration_points:
-            calc_x, calc_y = self.calculate_screen_center_offset(dist)
-            print(f"距离{dist}mm: 期望({expected_x},{expected_y}) vs 计算({calc_x:.1f},{calc_y:.1f})")
+        return True
     
-    def calculate_screen_center_offset(self, distance_mm):
-        """根据距离计算屏幕中心偏移量"""
-        # 限制距离范围在500-1500mm之间
-        distance_mm = max(500, min(1500, distance_mm))
-        
-        # 使用多项式计算偏移量
-        offset_x = np.polyval(self.poly_coeffs_x, distance_mm)
-        offset_y = np.polyval(self.poly_coeffs_y, distance_mm)
-        
-        return int(round(offset_x)), int(round(offset_y))
-
-class SimpleDistanceCalculator:
-    """简化的距离计算器（使用固定参数）"""
-    def __init__(self):
-        self.distance_history = []
-        self.max_history = 5
-        
-    def calculate_distance_from_width(self, pixel_width, frame_width):
-        """基于宽度计算距离（使用固定参数）"""
-        focal_length = CAMERA_PARAMS["focal_length_mm"]
-        sensor_width = CAMERA_PARAMS["sensor_width_mm"]
-        calibration_factor = CAMERA_PARAMS["calibration_factor"]
-        
-        fov_horizontal_rad = 2 * math.atan(sensor_width / (2 * focal_length))
-        mm_per_pixel_at_1m = (1000 * math.tan(fov_horizontal_rad / 2) * 2) / frame_width
-        
-        if pixel_width > 0 and mm_per_pixel_at_1m > 0:
-            distance_mm = (A4_WIDTH_MM * 1000) / (pixel_width * mm_per_pixel_at_1m)
-            return distance_mm * calibration_factor
-        return None
-    
-    def update_distance_history(self, distance):
-        """更新距离历史"""
-        if distance:
-            self.distance_history.append(distance)
-            if len(self.distance_history) > self.max_history:
-                self.distance_history.pop(0)
-    
-    def get_averaged_distance(self):
-        """获取平均距离"""
-        if self.distance_history:
-            return np.mean(self.distance_history)
-        return None
-
-# 原有的透视变换函数（完全不修改）
-def order_points(pts):
-    rect = np.zeros((4, 2), dtype = "float32")
-    s = pts.sum(axis = 1)
-    rect[0] = pts[np.argmin(s)]
-    rect[2] = pts[np.argmax(s)]
-    diff = np.diff(pts, axis = 1)
-    rect[1] = pts[np.argmin(diff)]
-    rect[3] = pts[np.argmax(diff)]
-    return rect
-
-# 修改后的A4纸检测函数（新增搜索逻辑）
-def find_a4_paper(frame, distance_calculator, offset_calculator):
-    """
-    在图像帧中检测带有黑边的白色A4纸。
-    使用动态屏幕中心偏移来适应不同距离。
-    新增：目标丢失时自动搜索功能。
-    """
-    global search_mode, target_lost_time, last_dx, last_dy, is_tarking, track_cnt
-    
-    # === 原有的检测逻辑（完全不修改） ===
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    gray = clahe.apply(gray)
-    
-    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
-    
-    thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                   cv2.THRESH_BINARY_INV, 11, 2)
-    
-    contours, _ = cv2.findContours(thresh, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:10]
-    
-    detected_rect = None
-    warped_image = None
-    
-    for contour in contours:
-        peri = cv2.arcLength(contour, True)
-        approx = cv2.approxPolyDP(contour, 0.02 * peri, True)
-        
-        if len(approx) == 4:
-            if cv2.contourArea(approx) < 1000:
-                continue
+    def send_no_detection_signal(self):
+        """发送未检测到矩形的信号 (1200,0)"""
+        try:
+            # 构造文本格式数据包: "1000,0\n"
+            packet = b"900,0\n"
             
-            if not cv2.isContourConvex(approx):
-                continue
+            # 发送到主串口
+            self.serial_controller.write(packet)
+            print(f"发送未检测信号: (1000, 0)")
             
-            x, y, w, h = cv2.boundingRect(approx)
+        except Exception as e:
+            print(f"发送未检测信号失败: {e}")
+    
+    def process_frame_without_detection(self, frame, calculated_distance):
+        """处理检测失败时的帧，使用计算的距离"""
+        # 使用计算的距离更新距离历史
+        self.distance_calculator.update_distance_history(calculated_distance)
+        avg_distance = self.distance_calculator.get_averaged_distance()
+        
+        # 计算屏幕中心偏移
+        if avg_distance:
+            offset_x, offset_y = self.offset_calculator.calculate_screen_center_offset(avg_distance)
+        else:
+            offset_x, offset_y = 0, 0
+        
+        # 使用屏幕中心作为虚拟中心点
+        height, width = frame.shape[:2]
+        center_x = width // 2
+        center_y = height // 2
+        
+        # 计算动态屏幕中心
+        screen_center_x = width // 2 + offset_x
+        screen_center_y = height // 2 + offset_y
+        
+        # 计算偏移量（使用屏幕中心）
+        dx = center_x - screen_center_x
+        dy = center_y - screen_center_y
+        
+        # 发送坐标数据
+        print(f"{-dx},{dy}")
+        self.serial_controller.write(f"{-dx},{dy}\n")
+        
+        # 绘制信息（不绘制检测矩形）
+        self.display_manager.draw_screen_center(frame, screen_center_x, screen_center_y)
+        
+        # 绘制虚拟中心点
+        cv2.circle(frame, (center_x, center_y), 3, (255, 0, 255), -1)  # 紫色圆点
+        cv2.putText(frame, "Virtual Center", (center_x - 50, center_y - 20), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
+        
+        info_y = self.display_manager.draw_distance_info(frame, calculated_distance, avg_distance)
+        
+        # 显示检测失败信息
+        cv2.putText(frame, f"Detection Failed #{self.detection_failure_count}", 
+                   (10, info_y + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        cv2.putText(frame, f"Using calculated distance: {calculated_distance:.1f}mm", 
+                   (10, info_y + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
+        
+        self.display_manager.draw_offset_info(frame, offset_x, offset_y, dx, dy, "Virtual", info_y + 60)
+        self.display_manager.draw_status_info(frame, self.serial_controller.is_connected())
+        
+        return frame, None, calculated_distance, avg_distance
+    
+    def process_frame(self, frame):
+        """处理单帧图像"""
+        # 如果已经检测到过矩形，直接使用最后检测到的矩形进行处理
+        if self.rect_detected_once:
+            # 尝试检测当前帧的矩形
+            detected_rect = self.a4_detector.detect_a4_paper(frame)
             
-            mask = np.zeros(gray.shape, dtype=np.uint8)
-            cv2.drawContours(mask, [approx], -1, (255), -1)
+            # 如果当前帧检测到矩形，使用当前矩形
+            if detected_rect is not None:
+                # 重置失败计数
+                self.detection_failure_count = 0
+                return self.process_frame_with_detection(frame, detected_rect)
+            else:
+                # 如果当前帧没检测到，递增失败计数并使用计算的距离
+                self.detection_failure_count += 1
+                calculated_distance = self.last_valid_distance / (1 + self.detection_failure_count)
+                print(f"检测失败 #{self.detection_failure_count}，使用计算距离: {calculated_distance:.1f}mm")
+                return self.process_frame_without_detection(frame, calculated_distance)
+        
+        # 第一次检测逻辑
+        detected_rect = self.a4_detector.detect_a4_paper(frame)
+        
+        # 如果没有检测到矩形，发送未检测信号
+        if detected_rect is None:
+            current_time = time.time()
+            if current_time - self.last_no_detection_send_time >= self.no_detection_send_interval:
+                self.send_no_detection_signal()
+                self.last_no_detection_send_time = current_time
             
-            kernel = np.ones((10, 10), np.uint8)
-            inner_mask = cv2.erode(mask, kernel, iterations=1)
-            mean_inner_val = cv2.mean(gray, mask=inner_mask)[0]
+            return frame, None, None, None
+        
+        # 第一次检测到矩形，设置标记
+        self.rect_detected_once = True
+        self.detection_failure_count = 0
+        print("*** 首次检测到矩形，进入永久检测模式 ***")
+        
+        # 检测到矩形后，执行basic2.py的完整逻辑
+        return self.process_frame_with_detection(frame, detected_rect)
+    
+    def process_frame_with_detection(self, frame, detected_rect):
+        """检测到矩形后的完整处理逻辑（basic2.py的逻辑）"""
+        # 创建透视变换图像
+        warped_image, M, detected_width, warped_size = self.a4_detector.create_warped_image(frame, detected_rect)
+        
+        if warped_image is None:
+            return frame, None, None, None
+        
+        # 在变换图像上绘制圆形并获取中心点
+        center_x, center_y = self.a4_detector.draw_circle_on_warped(warped_image, frame, M)
+        
+        # 距离测量
+        distance_mm = self.distance_calculator.calculate_distance_from_width(detected_width, frame.shape[1])
+        
+        # 保存有效距离
+        if distance_mm:
+            self.last_valid_distance = distance_mm
+        
+        self.distance_calculator.update_distance_history(distance_mm)
+        avg_distance = self.distance_calculator.get_averaged_distance()
+        
+        if self.fix_gap:
+            # debug 时，使用串口，手动修正间隙
+            global dx_from_uart, dy_from_uart
             
-            outer_mask = cv2.dilate(mask, kernel, iterations=1)
-            border_mask = cv2.subtract(outer_mask, mask)
-            mean_border_val = cv2.mean(gray, mask=border_mask)[0]
+            # 读取以0xA5 0x5A结束的数据包
+            packet = self.hmi.read_packet_with_terminator(timeout=0)
+            if packet:
+                result, message = self.hmi.parse_packet_data(packet)
+                print(f"收到数据包: {message}")
+                
+                if result == 'quit':
+                    print("收到退出命令，程序即将退出...")
+                    return frame, None, None, "quit"
+                
+                elif result == 'ok':
+                    # 收集校准点数据
+                    if distance_mm and len(self.calibration_points) < self.max_calibration_points:
+                        # 将数据转换为整数并存储
+                        calibration_point = [int(distance_mm), int(dx_from_uart), int(dy_from_uart)]
+                        self.calibration_points.append(calibration_point)
+                        print(f"收集校准点 {len(self.calibration_points)}/{self.max_calibration_points}: {calibration_point}")
+                        
+                        # 如果收集到3个校准点，更新配置文件
+                        if len(self.calibration_points) == self.max_calibration_points:
+                            self.update_calibration_points()
+                    else:
+                        if not distance_mm:
+                            print("错误: 距离数据无效，无法收集校准点")
+                        else:
+                            print(f"已收集足够的校准点({self.max_calibration_points}个)")
+                
+                elif isinstance(result, tuple):
+                    # 坐标数据
+                    x, y = result
+                    dx_from_uart = x
+                    dy_from_uart = y
+                    print(f"更新偏移量: dx={dx_from_uart}, dy={dy_from_uart}")
             
-            if mean_inner_val > MEAN_INNER_VAL and mean_border_val < MEAN_BORDER_VAL:
-                detected_rect = approx
+            offset_x, offset_y = dx_from_uart, dy_from_uart
+        else:
+            # 计算屏幕中心偏移
+            if avg_distance:
+                offset_x, offset_y = self.offset_calculator.calculate_screen_center_offset(avg_distance)
+            else:
+                offset_x, offset_y = 0, 0
+            
+        # 计算动态屏幕中心
+        screen_center_x = frame.shape[1] // 2 + offset_x
+        screen_center_y = frame.shape[0] // 2 + offset_y
+        
+        # 计算偏移量并检查对齐
+        dx, dy, alignment_status = self.a4_detector.calculate_offset_and_check_alignment(
+            center_x, center_y, screen_center_x, screen_center_y, self.serial_controller
+        )
+        
+        # 绘制所有信息
+        self.display_manager.draw_detection_info(frame, detected_rect, center_x, center_y)
+        self.display_manager.draw_screen_center(frame, screen_center_x, screen_center_y)
+        
+        info_y = self.display_manager.draw_distance_info(frame, distance_mm, avg_distance)
+        self.display_manager.draw_offset_info(frame, offset_x, offset_y, dx, dy, alignment_status, info_y)
+        self.display_manager.draw_status_info(frame, self.serial_controller.is_connected())
+        
+        # 更新变换视图
+        self.display_manager.update_transformed_view(warped_image)
+        
+        return frame, warped_image, distance_mm, avg_distance
+    
+    def run(self):
+        """运行主循环"""
+        if not self.initialize_camera():
+            return
+        
+        print("=== 增强版A4纸跟踪系统 ===")
+        print("特性: 未检测到矩形时每0.3s发送(1000,0)信号")
+        print("距离计算参数:", config.CAMERA_PARAMS)
+        print(f"距离范围: {config.MIN_DISTANCE_MM}-{config.MAX_DISTANCE_MM}mm")
+        
+        if self.display_manager.display_enabled:
+            print("\n操作:")
+            print("- 'q': 退出程序")
+            print("- 'h': 清除距离历史记录")
+            print("- 'd': 显示当前距离和偏移信息")
+        else:
+            print("\n运行在无头模式 - 使用 Ctrl+C 退出程序")
+        
+        while True:
+            ret, frame = self.cap.read()
+            if not ret:
+                print("错误：无法接收帧（视频流结束？）。正在退出...")
                 break
-    
-    # === 新增的搜索逻辑 ===
-    if detected_rect is None:
-        # 目标未检测到
-        current_time = time.time()
-        
-        if target_lost_time is None:
-            # 第一次丢失目标，记录时间
-            target_lost_time = current_time
-        
-        # 检查是否已经丢失超过0.3秒
-        if current_time - target_lost_time >= SEARCH_DELAY_SECONDS:
-            search_mode = True
-        
-        if search_mode:
-            # 搜索模式：发送400,0让云台向左旋转
-            print("搜索模式：向左旋转...")
-            serial_write(b"10,0\n")
             
-            # 在画面上显示搜索状态
-            cv2.putText(frame, "SEARCHING...", (frame.shape[1]//2 - 80, frame.shape[0]//2),
-                       cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
-            cv2.putText(frame, "Rotating Left", (frame.shape[1]//2 - 70, frame.shape[0]//2 + 40),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            # 处理帧
+            processed_frame, warped_image, distance, avg_distance = self.process_frame(frame)
             
-            # 显示丢失时间
-            lost_duration = current_time - target_lost_time if target_lost_time else 0
-            cv2.putText(frame, f"Lost: {lost_duration:.1f}s", (10, 60),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            # 检查是否收到串口退出命令
+            if avg_distance == "quit":
+                print("收到串口退出命令，程序退出")
+                break
+            
+            # 显示结果
+            self.display_manager.show_frames(processed_frame)
+            
+            # 处理键盘输入
+            key_result = self.display_manager.handle_keyboard_input(
+                self.distance_calculator, self.offset_calculator
+            )
+            
+            if key_result == 'quit':
+                break
         
-        # 状态显示
-        status_text = "Serial: ON" if ENABLE_SERIAL and ser is not None else "Serial: OFF"
-        cv2.putText(frame, status_text, (10, frame.shape[0] - 35), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0) if ENABLE_SERIAL and ser is not None else (0, 0, 255), 2)
+        self.cleanup()
+    
+    def cleanup(self):
+        """清理资源"""
+        # 释放摄像头
+        if self.cap:
+            self.cap.release()
         
-        cv2.putText(frame, "Mode: SEARCH", (10, frame.shape[0] - 10), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+        # 清理显示
+        self.display_manager.cleanup()
         
-        return frame, None, None, None
+        # 关闭串口
+        self.serial_controller.close()
+        
+        # 显示最终统计信息
+        self.show_final_statistics()
     
-    # === 目标检测到，切换到跟踪模式 ===
-    if search_mode:
-        print("目标找到！切换到跟踪模式")
-        search_mode = False
-    
-    target_lost_time = None  # 重置丢失时间
-    
-    # === 原有的透视变换和绘制逻辑（完全不修改） ===
-    cv2.drawContours(frame, [detected_rect], -1, (0, 255, 0), 3)
-    cv2.putText(frame, "A4 Paper Detected", (detected_rect.ravel()[0], detected_rect.ravel()[1] - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2)
-    
-    rect_pts = order_points(detected_rect.reshape(4, 2))
-    (tl, tr, br, bl) = rect_pts
-    
-    widthA = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
-    widthB = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
-    detected_width = max(int(widthA), int(widthB))
-    
-    heightA = np.sqrt(((tr[0] - br[0]) ** 2) + ((tr[1] - br[1]) ** 2))
-    heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
-    detected_height = max(int(heightA), int(heightB))
-    
-    aspect_ratio = 26.0 / 18.0
-    
-    if detected_width / detected_height > aspect_ratio:
-        maxWidth = detected_width
-        maxHeight = int(detected_width / aspect_ratio)
-    else:
-        maxHeight = detected_height
-        maxWidth = int(detected_height * aspect_ratio)
-    
-    dst = np.array([
-        [0, 0],
-        [maxWidth - 1, 0],
-        [maxWidth - 1, maxHeight - 1],
-        [0, maxHeight - 1]], dtype = "float32")
-    
-    M = cv2.getPerspectiveTransform(rect_pts, dst)
-    warped = cv2.warpPerspective(frame, M, (maxWidth, maxHeight))
-    
-    # === 原有的画圆逻辑（完全不修改） ===
-    PHYSICAL_WIDTH_CM = 26.0
-    PHYSICAL_HEIGHT_CM = 18.0
-    
-    pixels_per_cm_w = maxWidth / PHYSICAL_WIDTH_CM
-    pixels_per_cm_h = maxHeight / PHYSICAL_HEIGHT_CM
-    pixels_per_cm = (pixels_per_cm_w + pixels_per_cm_h) / 2.0
-    
-    CIRCLE_RADIUS_CM = 6.0
-    radius_px = int(CIRCLE_RADIUS_CM * pixels_per_cm)
-    
-    center_px = (maxWidth // 2, maxHeight // 2)
-    cv2.circle(warped, center_px, radius_px, (255, 0, 0), 1) 
-    
-    inv_M = np.linalg.inv(M)
-    
-    num_points = 100
-    circle_points_warped = []
-    for i in range(num_points):
-        angle = 2 * np.pi * i / num_points
-        x = center_px[0] + radius_px * np.cos(angle)
-        y = center_px[1] + radius_px * np.sin(angle)
-        circle_points_warped.append([x, y])
-    
-    circle_points_warped = np.array([circle_points_warped], dtype=np.float32)
-    original_circle_points = cv2.perspectiveTransform(circle_points_warped, inv_M)
-    cv2.polylines(frame, [np.int32(original_circle_points)], True, (255, 0, 0), 1)
-    
-    padding = 20
-    warped_image = cv2.copyMakeBorder(warped, padding, padding, padding, padding, cv2.BORDER_CONSTANT, value=[255, 255, 255])
-    
-    center_warped = (warped.shape[1] // 2, warped.shape[0] // 2)
-    center_warped_homogeneous = np.array([center_warped[0], center_warped[1], 1], dtype=np.float32)
-    original_center_homogeneous = inv_M.dot(center_warped_homogeneous)
-    original_center = (original_center_homogeneous[0] / original_center_homogeneous[2], original_center_homogeneous[1] / original_center_homogeneous[2])
-    
-    center_x, center_y = int(original_center[0]), int(original_center[1])
-    cv2.circle(frame, (center_x, center_y), 1, (0, 0, 255), -1)
-    cv2.putText(frame, "Center", (center_x - 30, center_y - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
-    
-    # === 距离测量 ===
-    distance_mm = distance_calculator.calculate_distance_from_width(detected_width, frame.shape[1])
-    distance_calculator.update_distance_history(distance_mm)
-    avg_distance = distance_calculator.get_averaged_distance()
-    
-    # === 使用动态屏幕中心偏移（原有核心逻辑） ===
-    if avg_distance:
-        offset_x, offset_y = offset_calculator.calculate_screen_center_offset(avg_distance)
-    else:
-        offset_x, offset_y = 0, 0  # 默认偏移
-    
-    # 计算动态屏幕中心
-    screen_center_x = frame.shape[1] // 2 + offset_x
-    screen_center_y = frame.shape[0] // 2 + offset_y
-    
-    # 计算偏移量
-    dx = center_x - screen_center_x
-    dy = center_y - screen_center_y
-    distance_to_center = np.sqrt(dx**2 + dy**2)
-    
-    cv2.circle(frame, (screen_center_x, screen_center_y), 3, (0, 255, 255), -1)
-    cv2.putText(frame, "Screen Center", (screen_center_x - 50, screen_center_y - 10), 
-               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
-    
-    # === 显示信息 ===
-    info_y = 30
-    if distance_mm:
-        cv2.putText(frame, f"Distance: {distance_mm:.1f}mm", (10, info_y),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-        info_y += 25
-    
-    if avg_distance:
-        cv2.putText(frame, f"Avg Dist: {avg_distance:.1f}mm", (10, info_y),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-        info_y += 25
-    
-    cv2.putText(frame, f"Screen Offset: ({offset_x}, {offset_y})", (10, info_y),
-               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (100, 255, 100), 1)
-    info_y += 20
-    
-    cv2.putText(frame, f"Target Offset: ({dx}, {dy})", (10, info_y),
-               cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-    
-    # === 原有的跟踪逻辑（完全不修改） ===
-    if abs(dx) + abs(dy) < 6 and abs(last_dx) + abs(last_dy) < 6 :
-        cv2.putText(frame, "Aligned", (screen_center_x - 50, screen_center_y + 20), 
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
-        if not is_tarking:
-            track_cnt += 1
-            if track_cnt > 5:
-                is_tarking = True
-                track_cnt = 0
-                time.sleep(0.01) 
-                serial_write(b"1\n")
-                time.sleep(0.01)
-    else:
-        is_tarking = False
-        track_cnt = 0
+    def show_final_statistics(self):
+        """显示最终统计信息"""
+        mean_distance, std_distance = self.distance_calculator.get_distance_statistics()
+        
+        if mean_distance is not None:
+            print("\n=== 最终统计信息 ===")
+            print(f"平均距离: {mean_distance:.1f} ± {std_distance:.1f} mm")
+            
+            # 显示最终的屏幕中心偏移
+            offset_x, offset_y = self.offset_calculator.calculate_screen_center_offset(mean_distance)
+            print(f"最终屏幕中心偏移: ({offset_x}, {offset_y})")
 
-    last_dx = dx
-    last_dy = dy
+# 参数调整接口类
+class SystemParameterManager:
+    """系统参数管理器 - 提供运行时参数调整接口"""
     
-    print(f"{-dx},{dy}")
-    serial_write(f"{-dx},{dy}\n".encode())
+    @staticmethod
+    def update_detection_parameters(mean_inner_val=None, mean_border_val=None):
+        """更新检测参数"""
+        if mean_inner_val is not None:
+            config.MEAN_INNER_VAL = mean_inner_val
+        if mean_border_val is not None:
+            config.MEAN_BORDER_VAL = mean_border_val
     
-    # === 状态显示 ===
-    status_text = "Serial: ON" if ENABLE_SERIAL and ser is not None else "Serial: OFF"
-    cv2.putText(frame, status_text, (10, frame.shape[0] - 35), 
-               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0) if ENABLE_SERIAL and ser is not None else (0, 0, 255), 2)
+    @staticmethod
+    def update_camera_parameters(focal_length=None, sensor_width=None, sensor_height=None, calibration_factor=None):
+        """更新摄像头参数"""
+        if focal_length is not None:
+            config.CAMERA_PARAMS["focal_length_mm"] = focal_length
+        if sensor_width is not None:
+            config.CAMERA_PARAMS["sensor_width_mm"] = sensor_width
+        if sensor_height is not None:
+            config.CAMERA_PARAMS["sensor_height_mm"] = sensor_height
+        if calibration_factor is not None:
+            config.CAMERA_PARAMS["calibration_factor"] = calibration_factor
     
-    cv2.putText(frame, "Mode: TRACKING", (10, frame.shape[0] - 10), 
-               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+    @staticmethod
+    def update_tracking_parameters(alignment_threshold=None, track_count_threshold=None):
+        """更新跟踪参数"""
+        if alignment_threshold is not None:
+            config.ALIGNMENT_THRESHOLD = alignment_threshold
+        if track_count_threshold is not None:
+            config.TRACK_COUNT_THRESHOLD = track_count_threshold
     
-    return frame, warped_image, distance_mm, avg_distance
+    @staticmethod
+    def update_distance_range(min_distance=None, max_distance=None):
+        """更新距离范围"""
+        if min_distance is not None:
+            config.MIN_DISTANCE_MM = min_distance
+        if max_distance is not None:
+            config.MAX_DISTANCE_MM = max_distance
+    
+    @staticmethod
+    def get_current_parameters():
+        """获取当前所有参数"""
+        return {
+            "detection": {
+                "mean_inner_val": config.MEAN_INNER_VAL,
+                "mean_border_val": config.MEAN_BORDER_VAL
+            },
+            "camera": config.CAMERA_PARAMS,
+            "tracking": {
+                "alignment_threshold": config.ALIGNMENT_THRESHOLD,
+                "track_count_threshold": config.TRACK_COUNT_THRESHOLD
+            },
+            "distance_range": {
+                "min_distance_mm": config.MIN_DISTANCE_MM,
+                "max_distance_mm": config.MAX_DISTANCE_MM
+            },
+            "calibration_points": config.CALIBRATION_POINTS
+        }
 
 def main():
-    global search_mode, target_lost_time
+    """主函数"""
+    # 创建系统实例
+    tracking_system = A4TrackingSystem()
     
-    # 初始化组件
-    distance_calculator = SimpleDistanceCalculator()
-    offset_calculator = DistanceOffsetCalculator()
+    # 可选：在运行前调整参数
+    # SystemParameterManager.update_detection_parameters(mean_inner_val=105, mean_border_val=75)
+    # SystemParameterManager.update_tracking_parameters(alignment_threshold=8)
     
-    # 打开摄像头
-    cap = cv2.VideoCapture(0)
-    
-    if not cap.isOpened():
-        print("错误：无法打开视频流。")
-        return
-    
-    print("=== A4纸跟踪系统（带自动搜索功能） ===")
-    print("距离计算参数:", CAMERA_PARAMS)
-    print("距离范围: 500-1500mm")
-    print("搜索参数: 目标丢失>{}秒后开始搜索".format(SEARCH_DELAY_SECONDS))
-    print("\n功能说明:")
-    print("- 无目标时：云台自动向左旋转搜索（丢失0.3秒后开始）")
-    print("- 有目标时：自动跟踪模式（发送dx,dy）")
-    print("\n操作:")
-    print("- 'q': 退出程序")
-    print("- 'h': 清除距离历史记录")
-    print("- 'd': 显示当前距离和偏移信息")
-    print("- 's': 手动切换到搜索模式")
-    
-    transformed_view = np.zeros((100, 100, 3), np.uint8)
-    
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            print("错误：无法接收帧（视频流结束？）。正在退出...")
-            break
-        
-        # 主处理函数
-        processed_frame, warped_image, distance, avg_distance = \
-            find_a4_paper(frame, distance_calculator, offset_calculator)
-        
-        cv2.imshow('A4 Paper Tracking System (with Auto Search)', processed_frame)
-        
-        if warped_image is not None:
-            transformed_view = warped_image
-        
-        cv2.imshow('Transformed Rectangle', transformed_view)
-        
-        # 键盘控制
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
-            break
-        elif key == ord('h'):
-            distance_calculator.distance_history.clear()
-            print("距离历史记录已清除")
-        elif key == ord('d'):
-            if avg_distance:
-                offset_x, offset_y = offset_calculator.calculate_screen_center_offset(avg_distance)
-                print(f"当前平均距离: {avg_distance:.1f}mm")
-                print(f"计算的屏幕中心偏移: ({offset_x}, {offset_y})")
-            print(f"当前模式: {'搜索' if search_mode else '跟踪'}")
-            if target_lost_time is not None:
-                lost_duration = time.time() - target_lost_time
-                print(f"目标丢失时长: {lost_duration:.2f}秒")
-            else:
-                print("目标状态: 正常跟踪")
-        elif key == ord('s'):
-            search_mode = True
-            target_lost_time = time.time()
-            print("手动切换到搜索模式")
-    
-    # 完成后，释放摄像头并关闭所有窗口
-    cap.release()
-    cv2.destroyAllWindows()
-    
-    # 关闭串口连接
-    if ENABLE_SERIAL and ser is not None:
-        ser.close()
-        print("串口已关闭")
-    
-    # 显示最终统计信息
-    if distance_calculator.distance_history:
-        avg_distance = np.mean(distance_calculator.distance_history)
-        std_distance = np.std(distance_calculator.distance_history)
-        print(f"\n=== 最终统计信息 ===")
-        print(f"平均距离: {avg_distance:.1f} ± {std_distance:.1f} mm")
-        
-        # 显示最终的屏幕中心偏移
-        offset_x, offset_y = offset_calculator.calculate_screen_center_offset(avg_distance)
-        print(f"最终屏幕中心偏移: ({offset_x}, {offset_y})")
+    # 运行系统
+    try:
+        tracking_system.run()
+    except KeyboardInterrupt:
+        print("\n用户中断程序")
+        tracking_system.cleanup()
+    except Exception as e:
+        print(f"程序运行错误: {e}")
+        tracking_system.cleanup()
 
 if __name__ == '__main__':
     main()
