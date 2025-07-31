@@ -5,35 +5,33 @@
 """
 
 import cv2
+import numpy as np
 
 # 导入模块化组件
-from dynamic_config import config
+from config import *
 from serial_controller import SerialController
 from distance_offset_calculator import DistanceOffsetCalculator
 from distance_calculator import SimpleDistanceCalculator
 from a4_detector import A4PaperDetector
 from display_manager import DisplayManager
 
+# from config import ENABLE_SERIAL, SERIAL_PORT, SERIAL_BAUDRATE
+
+
 class A4TrackingSystem:
     """A4纸跟踪系统主类"""
     
     def __init__(self):
         # 初始化所有组件
-        self.serial_controller = SerialController(config.SERIAL_PORT, config.SERIAL_BAUDRATE)
-        self.hmi = SerialController(config.HMI_PORT, config.HMI_BAUDRATE)
+        self.serial_controller = SerialController(SERIAL_PORT, SERIAL_BAUDRATE)
+        self.hmi = SerialController(HMI_PORT, HMI_BAUDRATE)
         self.distance_calculator = SimpleDistanceCalculator()
         self.offset_calculator = DistanceOffsetCalculator()
         self.a4_detector = A4PaperDetector()
         self.display_manager = DisplayManager()
-
-        self.fix_gap = False
         
         # 摄像头
         self.cap = None
-
-    def set_fix_gap(self, fix_gap):
-        """设置是否修正误差"""
-        self.fix_gap = fix_gap
         
     def initialize_camera(self, camera_index=0):
         """初始化摄像头"""
@@ -67,21 +65,12 @@ class A4TrackingSystem:
         self.distance_calculator.update_distance_history(distance_mm)
         avg_distance = self.distance_calculator.get_averaged_distance()
         
-        if self.fix_gap:
-            # 计算屏幕中心偏移
-            if avg_distance:
-                offset_x, offset_y = self.offset_calculator.calculate_screen_center_offset(avg_distance)
-            else:
-                offset_x, offset_y = 0, 0
-            
+        # 计算屏幕中心偏移
+        if avg_distance:
+            offset_x, offset_y = self.offset_calculator.calculate_screen_center_offset(avg_distance)
         else:
-            # debug 时，使用串口，手动修正间隙
             offset_x, offset_y = 0, 0
-
         
-        msg=self.hmi.read_line()
-        print("收到串口数据：", msg)
-
         # 计算动态屏幕中心
         screen_center_x = frame.shape[1] // 2 + offset_x
         screen_center_y = frame.shape[0] // 2 + offset_y
@@ -110,16 +99,12 @@ class A4TrackingSystem:
             return
         
         print("=== 模块化A4纸跟踪系统 ===")
-        print("距离计算参数:", config.CAMERA_PARAMS)
-        print(f"距离范围: {config.MIN_DISTANCE_MM}-{config.MAX_DISTANCE_MM}mm")
-        
-        if self.display_manager.display_enabled:
-            print("\n操作:")
-            print("- 'q': 退出程序")
-            print("- 'h': 清除距离历史记录")
-            print("- 'd': 显示当前距离和偏移信息")
-        else:
-            print("\n运行在无头模式 - 使用 Ctrl+C 退出程序")
+        print("距离计算参数:", CAMERA_PARAMS)
+        print(f"距离范围: {MIN_DISTANCE_MM}-{MAX_DISTANCE_MM}mm")
+        print("\n操作:")
+        print("- 'q': 退出程序")
+        print("- 'h': 清除距离历史记录")
+        print("- 'd': 显示当前距离和偏移信息")
         
         while True:
             ret, frame = self.cap.read()
@@ -163,7 +148,7 @@ class A4TrackingSystem:
         mean_distance, std_distance = self.distance_calculator.get_distance_statistics()
         
         if mean_distance is not None:
-            print("\n=== 最终统计信息 ===")
+            print(f"\n=== 最终统计信息 ===")
             print(f"平均距离: {mean_distance:.1f} ± {std_distance:.1f} mm")
             
             # 显示最终的屏幕中心偏移
@@ -177,57 +162,60 @@ class SystemParameterManager:
     @staticmethod
     def update_detection_parameters(mean_inner_val=None, mean_border_val=None):
         """更新检测参数"""
+        global MEAN_INNER_VAL, MEAN_BORDER_VAL
         if mean_inner_val is not None:
-            config.MEAN_INNER_VAL = mean_inner_val
+            MEAN_INNER_VAL = mean_inner_val
         if mean_border_val is not None:
-            config.MEAN_BORDER_VAL = mean_border_val
+            MEAN_BORDER_VAL = mean_border_val
     
     @staticmethod
     def update_camera_parameters(focal_length=None, sensor_width=None, sensor_height=None, calibration_factor=None):
         """更新摄像头参数"""
         if focal_length is not None:
-            config.CAMERA_PARAMS["focal_length_mm"] = focal_length
+            CAMERA_PARAMS["focal_length_mm"] = focal_length
         if sensor_width is not None:
-            config.CAMERA_PARAMS["sensor_width_mm"] = sensor_width
+            CAMERA_PARAMS["sensor_width_mm"] = sensor_width
         if sensor_height is not None:
-            config.CAMERA_PARAMS["sensor_height_mm"] = sensor_height
+            CAMERA_PARAMS["sensor_height_mm"] = sensor_height
         if calibration_factor is not None:
-            config.CAMERA_PARAMS["calibration_factor"] = calibration_factor
+            CAMERA_PARAMS["calibration_factor"] = calibration_factor
     
     @staticmethod
     def update_tracking_parameters(alignment_threshold=None, track_count_threshold=None):
         """更新跟踪参数"""
+        global ALIGNMENT_THRESHOLD, TRACK_COUNT_THRESHOLD
         if alignment_threshold is not None:
-            config.ALIGNMENT_THRESHOLD = alignment_threshold
+            ALIGNMENT_THRESHOLD = alignment_threshold
         if track_count_threshold is not None:
-            config.TRACK_COUNT_THRESHOLD = track_count_threshold
+            TRACK_COUNT_THRESHOLD = track_count_threshold
     
     @staticmethod
     def update_distance_range(min_distance=None, max_distance=None):
         """更新距离范围"""
+        global MIN_DISTANCE_MM, MAX_DISTANCE_MM
         if min_distance is not None:
-            config.MIN_DISTANCE_MM = min_distance
+            MIN_DISTANCE_MM = min_distance
         if max_distance is not None:
-            config.MAX_DISTANCE_MM = max_distance
+            MAX_DISTANCE_MM = max_distance
     
     @staticmethod
     def get_current_parameters():
         """获取当前所有参数"""
         return {
             "detection": {
-                "mean_inner_val": config.MEAN_INNER_VAL,
-                "mean_border_val": config.MEAN_BORDER_VAL
+                "mean_inner_val": MEAN_INNER_VAL,
+                "mean_border_val": MEAN_BORDER_VAL
             },
-            "camera": config.CAMERA_PARAMS,
+            "camera": CAMERA_PARAMS,
             "tracking": {
-                "alignment_threshold": config.ALIGNMENT_THRESHOLD,
-                "track_count_threshold": config.TRACK_COUNT_THRESHOLD
+                "alignment_threshold": ALIGNMENT_THRESHOLD,
+                "track_count_threshold": TRACK_COUNT_THRESHOLD
             },
             "distance_range": {
-                "min_distance_mm": config.MIN_DISTANCE_MM,
-                "max_distance_mm": config.MAX_DISTANCE_MM
+                "min_distance_mm": MIN_DISTANCE_MM,
+                "max_distance_mm": MAX_DISTANCE_MM
             },
-            "calibration_points": config.CALIBRATION_POINTS
+            "calibration_points": CALIBRATION_POINTS
         }
 
 def main():

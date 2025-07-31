@@ -1,11 +1,21 @@
 import cv2
 import numpy as np
+import os
+from dynamic_config import config
 
 class DisplayManager:
     """显示管理器 - 负责所有的图像显示和信息绘制"""
     
     def __init__(self):
         self.transformed_view = np.zeros((100, 100, 3), np.uint8)
+        self.display_enabled = config.ENABLE_DISPLAY
+        
+        # 检测是否在SSH环境下
+        self.is_ssh = 'SSH_CLIENT' in os.environ or 'SSH_TTY' in os.environ or os.environ.get('DISPLAY', '') == ''
+        
+        if self.is_ssh and self.display_enabled:
+            print("检测到SSH环境，将禁用图像显示窗口")
+            self.display_enabled = False
     
     def draw_detection_info(self, frame, detected_rect, center_x, center_y):
         """绘制检测信息"""
@@ -79,11 +89,27 @@ class DisplayManager:
     
     def show_frames(self, processed_frame):
         """显示所有窗口"""
-        cv2.imshow('Simplified A4 Paper Tracking System', processed_frame)
-        cv2.imshow('Transformed Rectangle', self.transformed_view)
+        if not self.display_enabled:
+            return
+            
+        try:
+            cv2.imshow('Simplified A4 Paper Tracking System', processed_frame)
+            cv2.imshow('Transformed Rectangle', self.transformed_view)
+        except cv2.error as e:
+            if "can't open display" in str(e).lower() or "no display" in str(e).lower():
+                print("无法打开显示器，切换到无头模式")
+                self.display_enabled = False
+            else:
+                raise e
     
     def handle_keyboard_input(self, distance_calculator, offset_calculator):
         """处理键盘输入"""
+        if not self.display_enabled:
+            # 无显示模式下，添加简单的延时避免CPU占用过高
+            import time
+            time.sleep(0.01)
+            return None
+            
         key = cv2.waitKey(1) & 0xFF
         
         if key == ord('q'):
@@ -102,4 +128,8 @@ class DisplayManager:
     
     def cleanup(self):
         """清理资源"""
-        cv2.destroyAllWindows()
+        if self.display_enabled:
+            try:
+                cv2.destroyAllWindows()
+            except:
+                pass  # 忽略清理时的错误

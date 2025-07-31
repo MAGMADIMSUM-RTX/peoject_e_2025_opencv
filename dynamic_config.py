@@ -37,6 +37,14 @@ class DynamicConfig:
             "SERIAL_PORT": '/dev/serial/by-id/usb-ATK_ATK-HSWL-CMSIS-DAP_ATK_20190528-if00',
             "SERIAL_BAUDRATE": 115200,
             
+            # HMI串口配置
+            "ENABLE_HMI": True,
+            "HMI_PORT": '/dev/serial0',
+            "HMI_BAUDRATE": 115200,
+            
+            # 显示控制配置
+            "ENABLE_DISPLAY": False,
+            
             # 跟踪参数
             "ALIGNMENT_THRESHOLD": 6,
             "TRACK_COUNT_THRESHOLD": 4,

@@ -1,13 +1,7 @@
 import cv2
 import numpy as np
 import time
-from config import (
-    MEAN_INNER_VAL, MEAN_BORDER_VAL, CLAHE_CLIP_LIMIT, CLAHE_TILE_GRID_SIZE,
-    GAUSSIAN_BLUR_KERNEL, ADAPTIVE_THRESH_BLOCK_SIZE, ADAPTIVE_THRESH_C,
-    CONTOUR_AREA_THRESHOLD, APPROX_EPSILON_FACTOR, MORPHOLOGY_KERNEL_SIZE,
-    CIRCLE_RADIUS_CM, PHYSICAL_WIDTH_CM, PHYSICAL_HEIGHT_CM,
-    ALIGNMENT_THRESHOLD, TRACK_COUNT_THRESHOLD
-)
+from dynamic_config import config
 
 def order_points(pts):
     """对四个点进行排序"""
@@ -34,15 +28,15 @@ class A4PaperDetector:
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         
         # 自适应直方图均衡化
-        clahe = cv2.createCLAHE(clipLimit=CLAHE_CLIP_LIMIT, tileGridSize=CLAHE_TILE_GRID_SIZE)
+        clahe = cv2.createCLAHE(clipLimit=config.CLAHE_CLIP_LIMIT, tileGridSize=config.CLAHE_TILE_GRID_SIZE)
         gray = clahe.apply(gray)
         
         # 高斯模糊
-        blurred = cv2.GaussianBlur(gray, GAUSSIAN_BLUR_KERNEL, 0)
+        blurred = cv2.GaussianBlur(gray, config.GAUSSIAN_BLUR_KERNEL, 0)
         
         # 自适应阈值
         thresh = cv2.adaptiveThreshold(blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                       cv2.THRESH_BINARY_INV, ADAPTIVE_THRESH_BLOCK_SIZE, ADAPTIVE_THRESH_C)
+                                       cv2.THRESH_BINARY_INV, config.ADAPTIVE_THRESH_BLOCK_SIZE, config.ADAPTIVE_THRESH_C)
         
         # 查找轮廓
         contours, _ = cv2.findContours(thresh, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
@@ -52,10 +46,10 @@ class A4PaperDetector:
         
         for contour in contours:
             peri = cv2.arcLength(contour, True)
-            approx = cv2.approxPolyDP(contour, APPROX_EPSILON_FACTOR * peri, True)
+            approx = cv2.approxPolyDP(contour, config.APPROX_EPSILON_FACTOR * peri, True)
             
             if len(approx) == 4:
-                if cv2.contourArea(approx) < CONTOUR_AREA_THRESHOLD:
+                if cv2.contourArea(approx) < config.CONTOUR_AREA_THRESHOLD:
                     continue
                 
                 if not cv2.isContourConvex(approx):
@@ -74,7 +68,7 @@ class A4PaperDetector:
         cv2.drawContours(mask, [approx], -1, (255), -1)
         
         # 内部区域（白纸部分）
-        kernel = np.ones(MORPHOLOGY_KERNEL_SIZE, np.uint8)
+        kernel = np.ones(config.MORPHOLOGY_KERNEL_SIZE, np.uint8)
         inner_mask = cv2.erode(mask, kernel, iterations=1)
         mean_inner_val = cv2.mean(gray, mask=inner_mask)[0]
         
@@ -83,7 +77,7 @@ class A4PaperDetector:
         border_mask = cv2.subtract(outer_mask, mask)
         mean_border_val = cv2.mean(gray, mask=border_mask)[0]
         
-        return mean_inner_val > MEAN_INNER_VAL and mean_border_val < MEAN_BORDER_VAL
+        return mean_inner_val > config.MEAN_INNER_VAL and mean_border_val < config.MEAN_BORDER_VAL
     
     def create_warped_image(self, frame, detected_rect):
         """创建透视变换后的图像"""
@@ -129,12 +123,12 @@ class A4PaperDetector:
         maxWidth, maxHeight = warped.shape[1], warped.shape[0]
         
         # 计算像素/厘米比例
-        pixels_per_cm_w = maxWidth / PHYSICAL_WIDTH_CM
-        pixels_per_cm_h = maxHeight / PHYSICAL_HEIGHT_CM
+        pixels_per_cm_w = maxWidth / config.PHYSICAL_WIDTH_CM
+        pixels_per_cm_h = maxHeight / config.PHYSICAL_HEIGHT_CM
         pixels_per_cm = (pixels_per_cm_w + pixels_per_cm_h) / 2.0
         
         # 绘制圆形
-        radius_px = int(CIRCLE_RADIUS_CM * pixels_per_cm)
+        radius_px = int(config.CIRCLE_RADIUS_CM * pixels_per_cm)
         center_px = (maxWidth // 2, maxHeight // 2)
         cv2.circle(warped, center_px, radius_px, (255, 0, 0), 1)
         
@@ -168,10 +162,10 @@ class A4PaperDetector:
         dy = center_y - screen_center_y
         
         # 检查对齐状态
-        if abs(dx) + abs(dy) < ALIGNMENT_THRESHOLD and abs(self.last_dx) + abs(self.last_dy) < ALIGNMENT_THRESHOLD:
+        if abs(dx) + abs(dy) < config.ALIGNMENT_THRESHOLD and abs(self.last_dx) + abs(self.last_dy) < config.ALIGNMENT_THRESHOLD:
             if not self.is_tracking:
                 self.track_cnt += 1
-                if self.track_cnt > TRACK_COUNT_THRESHOLD:
+                if self.track_cnt > config.TRACK_COUNT_THRESHOLD:
                     self.is_tracking = True
                     self.track_cnt = 0
                     time.sleep(0.001)
@@ -186,6 +180,12 @@ class A4PaperDetector:
         # 发送偏移数据
         print(f"{-dx},{dy}")
         serial_controller.write(f"{-dx},{dy}\n")
+        
+        # 可选：读取串口返回的数据
+        if serial_controller.in_waiting() > 0:
+            response = serial_controller.read_line(timeout=0.1)
+            if response:
+                print(f"串口返回: {response}")
         
         self.last_dx = dx
         self.last_dy = dy

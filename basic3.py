@@ -25,8 +25,8 @@ track_cnt = 0
 
 # 搜索模式参数（新增）
 search_mode = True  # 初始状态为搜索模式
-target_lost_frames = 0  # 目标丢失帧数计数器
-MAX_LOST_FRAMES = 10  # 连续丢失多少帧后进入搜索模式
+target_lost_time = None  # 目标丢失开始时间
+SEARCH_DELAY_SECONDS = 10.0  # 连续丢失0.3秒后进入搜索模式
 
 # 固定的已校准距离测量参数
 CAMERA_PARAMS = {
@@ -153,7 +153,7 @@ def find_a4_paper(frame, distance_calculator, offset_calculator):
     使用动态屏幕中心偏移来适应不同距离。
     新增：目标丢失时自动搜索功能。
     """
-    global search_mode, target_lost_frames, last_dx, last_dy, is_tarking, track_cnt
+    global search_mode, target_lost_time, last_dx, last_dy, is_tarking, track_cnt
     
     # === 原有的检测逻辑（完全不修改） ===
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
@@ -203,21 +203,31 @@ def find_a4_paper(frame, distance_calculator, offset_calculator):
     # === 新增的搜索逻辑 ===
     if detected_rect is None:
         # 目标未检测到
-        target_lost_frames += 1
+        current_time = time.time()
         
-        if target_lost_frames >= MAX_LOST_FRAMES:
+        if target_lost_time is None:
+            # 第一次丢失目标，记录时间
+            target_lost_time = current_time
+        
+        # 检查是否已经丢失超过0.3秒
+        if current_time - target_lost_time >= SEARCH_DELAY_SECONDS:
             search_mode = True
         
         if search_mode:
             # 搜索模式：发送400,0让云台向左旋转
             print("搜索模式：向左旋转...")
-            serial_write(b"400,0\n")
+            serial_write(b"10,0\n")
             
             # 在画面上显示搜索状态
             cv2.putText(frame, "SEARCHING...", (frame.shape[1]//2 - 80, frame.shape[0]//2),
                        cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
             cv2.putText(frame, "Rotating Left", (frame.shape[1]//2 - 70, frame.shape[0]//2 + 40),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+            
+            # 显示丢失时间
+            lost_duration = current_time - target_lost_time if target_lost_time else 0
+            cv2.putText(frame, f"Lost: {lost_duration:.1f}s", (10, 60),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
         
         # 状态显示
         status_text = "Serial: ON" if ENABLE_SERIAL and ser is not None else "Serial: OFF"
@@ -234,7 +244,7 @@ def find_a4_paper(frame, distance_calculator, offset_calculator):
         print("目标找到！切换到跟踪模式")
         search_mode = False
     
-    target_lost_frames = 0  # 重置丢失帧计数器
+    target_lost_time = None  # 重置丢失时间
     
     # === 原有的透视变换和绘制逻辑（完全不修改） ===
     cv2.drawContours(frame, [detected_rect], -1, (0, 255, 0), 3)
@@ -386,6 +396,8 @@ def find_a4_paper(frame, distance_calculator, offset_calculator):
     return frame, warped_image, distance_mm, avg_distance
 
 def main():
+    global search_mode, target_lost_time
+    
     # 初始化组件
     distance_calculator = SimpleDistanceCalculator()
     offset_calculator = DistanceOffsetCalculator()
@@ -400,9 +412,9 @@ def main():
     print("=== A4纸跟踪系统（带自动搜索功能） ===")
     print("距离计算参数:", CAMERA_PARAMS)
     print("距离范围: 500-1500mm")
-    print("搜索参数: 目标丢失>{}帧后开始搜索".format(MAX_LOST_FRAMES))
+    print("搜索参数: 目标丢失>{}秒后开始搜索".format(SEARCH_DELAY_SECONDS))
     print("\n功能说明:")
-    print("- 无目标时：云台自动向左旋转搜索（发送400,0）")
+    print("- 无目标时：云台自动向左旋转搜索（丢失0.3秒后开始）")
     print("- 有目标时：自动跟踪模式（发送dx,dy）")
     print("\n操作:")
     print("- 'q': 退出程序")
@@ -442,11 +454,14 @@ def main():
                 print(f"当前平均距离: {avg_distance:.1f}mm")
                 print(f"计算的屏幕中心偏移: ({offset_x}, {offset_y})")
             print(f"当前模式: {'搜索' if search_mode else '跟踪'}")
-            print(f"目标丢失帧数: {target_lost_frames}")
+            if target_lost_time is not None:
+                lost_duration = time.time() - target_lost_time
+                print(f"目标丢失时长: {lost_duration:.2f}秒")
+            else:
+                print("目标状态: 正常跟踪")
         elif key == ord('s'):
-            global search_mode, target_lost_frames
             search_mode = True
-            target_lost_frames = MAX_LOST_FRAMES
+            target_lost_time = time.time()
             print("手动切换到搜索模式")
     
     # 完成后，释放摄像头并关闭所有窗口

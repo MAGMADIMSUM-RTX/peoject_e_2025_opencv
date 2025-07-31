@@ -1,0 +1,23 @@
+[Unit]
+Description=A4 Paper Tracking System (Headless Mode)
+After=network.target graphical-session.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=lc
+Group=lc
+WorkingDirectory=/home/lc/code
+Environment=DISPLAY=:0
+Environment=PYTHONPATH=/home/lc/code
+ExecStart=/usr/bin/python3 /home/lc/code/headless_runner.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# 确保摄像头和串口权限
+SupplementaryGroups=video dialout
+
+[Install]
+WantedBy=multi-user.target

@@ -33,7 +33,8 @@
 ### 2. serial_controller.py
 串口通信控制：
 - 自动初始化串口连接
-- 安全的数据发送
+- 安全的数据发送和接收
+- 支持读取完整行数据（以\n结尾）
 - 连接状态管理
 - 错误处理
 
@@ -82,7 +83,7 @@ system.run()
 
 ### 带参数调整
 ```python
-from main_modular import A4TrackingSystem, SystemParameterManager
+from basic2 import A4TrackingSystem, SystemParameterManager
 
 # 调整检测参数
 SystemParameterManager.update_detection_parameters(
@@ -145,14 +146,62 @@ system.run()
 ## 运行示例
 
 ```bash
-# 基本运行
+# 本地运行（带界面）
 python main_modular.py
+
+# SSH远程运行（自动无头模式）
+python ssh_run.py
 
 # 运行示例程序（包含参数调整示例）
 python example_usage.py
 
-# 运行时配置管理（GUI或键盘控制）
+# 完整无头模式（可选）
 python runtime_config_example.py
+```
+
+## 串口通信功能
+
+### 发送数据
+系统会自动发送偏移数据：
+```
+-dx,dy\n  # 负的x偏移，y偏移
+```
+
+### 读取数据
+支持多种读取方式：
+```python
+# 读取完整行（推荐）
+line = serial_controller.read_line(timeout=1.0)
+
+# 逐字节读取直到\n
+data = serial_controller.read_until_newline()
+
+# 检查缓冲区
+if serial_controller.in_waiting() > 0:
+    data = serial_controller.read_line()
+```
+
+### 测试串口通信
+```bash
+python serial_test.py
+```
+
+## SSH/无头模式运行
+
+系统会自动检测SSH环境并禁用图像显示窗口：
+- 检测SSH_CLIENT、SSH_TTY环境变量
+- 检测DISPLAY环境变量为空
+- 自动切换到无头模式，避免显示相关错误
+
+### 快速SSH运行
+```bash
+python ssh_run.py
+```
+
+### 手动禁用显示
+在config.py中设置：
+```python
+ENABLE_DISPLAY = False
 ```
 
 ## 运行时配置修改

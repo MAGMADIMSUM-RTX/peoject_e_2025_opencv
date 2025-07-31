@@ -1,12 +1,12 @@
 import numpy as np
-from config import CALIBRATION_POINTS, MIN_DISTANCE_MM, MAX_DISTANCE_MM
+from dynamic_config import config
 
 class DistanceOffsetCalculator:
     """基于距离的屏幕中心偏移计算器"""
     
     def __init__(self, calibration_points=None):
         # 使用提供的校准点或默认校准点
-        self.calibration_points = calibration_points or CALIBRATION_POINTS
+        self.calibration_points = calibration_points or config.CALIBRATION_POINTS
         
         # 提取数据进行拟合
         distances = [point[0] for point in self.calibration_points]
@@ -34,7 +34,7 @@ class DistanceOffsetCalculator:
     def calculate_screen_center_offset(self, distance_mm):
         """根据距离计算屏幕中心偏移量"""
         # 限制距离范围
-        distance_mm = max(MIN_DISTANCE_MM, min(MAX_DISTANCE_MM, distance_mm))
+        distance_mm = max(config.MIN_DISTANCE_MM, min(config.MAX_DISTANCE_MM, distance_mm))
         
         # 使用多项式计算偏移量
         offset_x = np.polyval(self.poly_coeffs_x, distance_mm)

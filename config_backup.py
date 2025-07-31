@@ -21,13 +21,10 @@ ENABLE_SERIAL = True  # 设置为 False 可以禁用串口功能
 SERIAL_PORT = '/dev/serial/by-id/usb-ATK_ATK-HSWL-CMSIS-DAP_ATK_20190528-if00'
 SERIAL_BAUDRATE = 115200
 
-# 屏幕串口控制宏定义
-ENABLE_HMI = True  # 设置为 False 可以禁用串口功能
-HMI_PORT = '/dev/serial0'
-HMI_BAUDRATE = 115200
-
 # 显示控制宏定义
 ENABLE_DISPLAY = False  # 设置为 False 可以禁用所有显示功能（适用于SSH/无头模式）
+ENABLE_GUI_WINDOWS = True  # 设置为 False 仅禁用OpenCV窗口显示
+ENABLE_CONSOLE_OUTPUT = True  # 设置为 False 禁用控制台输出
 
 # 跟踪参数
 ALIGNMENT_THRESHOLD = 6  # 对齐阈值

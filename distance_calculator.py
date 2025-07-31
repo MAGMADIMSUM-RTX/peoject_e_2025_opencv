@@ -1,27 +1,25 @@
 import math
 import numpy as np
-from config import (
-    CAMERA_PARAMS, A4_WIDTH_MM, MAX_DISTANCE_HISTORY
-)
+from dynamic_config import config
 
 class SimpleDistanceCalculator:
     """简化的距离计算器（使用固定参数）"""
     
     def __init__(self, max_history=None):
         self.distance_history = []
-        self.max_history = max_history or MAX_DISTANCE_HISTORY
+        self.max_history = max_history or config.MAX_DISTANCE_HISTORY
         
     def calculate_distance_from_width(self, pixel_width, frame_width):
         """基于宽度计算距离（使用固定参数）"""
-        focal_length = CAMERA_PARAMS["focal_length_mm"]
-        sensor_width = CAMERA_PARAMS["sensor_width_mm"]
-        calibration_factor = CAMERA_PARAMS["calibration_factor"]
+        focal_length = config.CAMERA_PARAMS["focal_length_mm"]
+        sensor_width = config.CAMERA_PARAMS["sensor_width_mm"]
+        calibration_factor = config.CAMERA_PARAMS["calibration_factor"]
         
         fov_horizontal_rad = 2 * math.atan(sensor_width / (2 * focal_length))
         mm_per_pixel_at_1m = (1000 * math.tan(fov_horizontal_rad / 2) * 2) / frame_width
         
         if pixel_width > 0 and mm_per_pixel_at_1m > 0:
-            distance_mm = (A4_WIDTH_MM * 1000) / (pixel_width * mm_per_pixel_at_1m)
+            distance_mm = (config.A4_WIDTH_MM * 1000) / (pixel_width * mm_per_pixel_at_1m)
             return distance_mm * calibration_factor
         return None
     
