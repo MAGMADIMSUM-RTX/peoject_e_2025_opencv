@@ -1,7 +1,12 @@
 import cv2
 import time
 import numpy as np
-import serial
+
+# 串口控制宏定义
+ENABLE_SERIAL = False  # 设置为 False 可以禁用串口功能
+
+if ENABLE_SERIAL:
+    import serial
 
 MEAN_INNER_VAL = 100
 MEAN_BORDER_VAL = 80
@@ -12,10 +17,30 @@ last_dy = 100
 is_tarking = False
 track_cnt = 0
 
-ser = serial.Serial(
-    port='/dev/serial/by-id/usb-ATK_ATK-HSWL-CMSIS-DAP_ATK_20190528-if00', # 串口设备名称
-    baudrate=115200, # 波特率
-)
+# 串口初始化（仅在启用串口时）
+ser = None
+if ENABLE_SERIAL:
+    try:
+        ser = serial.Serial(
+            port='/dev/serial/by-id/usb-ATK_ATK-HSWL-CMSIS-DAP_ATK_20190528-if00', # 串口设备名称
+            baudrate=115200, # 波特率
+        )
+        print("串口已成功连接")
+    except Exception as e:
+        print(f"串口连接失败: {e}")
+        print("程序将在无串口模式下运行")
+        ENABLE_SERIAL = False
+        ser = None
+else:
+    print("串口功能已禁用")
+
+def serial_write(data):
+    """安全的串口写入函数"""
+    if ENABLE_SERIAL and ser is not None:
+        try:
+            ser.write(data)
+        except Exception as e:
+            print(f"串口写入错误: {e}")
 
 def order_points(pts):
     # initialzie a list of coordinates that will be ordered
@@ -245,7 +270,7 @@ def find_a4_paper(frame):
                     is_tarking = True
                     track_cnt = 0
                     time.sleep(0.01) 
-                    ser.write(b"1\n")
+                    serial_write(b"1\n")
                     time.sleep(0.01)
         else:
             is_tarking = False
@@ -255,11 +280,15 @@ def find_a4_paper(frame):
         last_dy = dy
         # 打印距离信息
         print(f"{-dx},{dy}")
-        ser.write(f"{-dx},{dy}\n".encode())
+        serial_write(f"{-dx},{dy}\n".encode())
         # 在图像上显示距离信息
         # cv2.putText(frame, f"dx:{dx}, dy:{dy}", (10, 30), 
         #            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
+        # 显示串口状态
+        status_text = "Serial: ON" if ENABLE_SERIAL and ser is not None else "Serial: OFF"
+        cv2.putText(frame, status_text, (10, 30), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0) if ENABLE_SERIAL and ser is not None else (0, 0, 255), 2)
 
     return frame, warped_image
 
@@ -302,6 +331,11 @@ def main():
     # 完成后，释放摄像头并关闭所有窗口
     cap.release()
     cv2.destroyAllWindows()
+    
+    # 关闭串口连接
+    if ENABLE_SERIAL and ser is not None:
+        ser.close()
+        print("串口已关闭")
 
 if __name__ == '__main__':
     main()
