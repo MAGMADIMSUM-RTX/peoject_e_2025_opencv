@@ -51,6 +51,98 @@ class A4TrackingSystem:
         self.last_valid_distance = None
         self.detection_failure_count = 0
 
+    def read_hmi_command_packet(self, timeout=1.0):
+        """读取新格式的HMI指令数据包: AA + 指令内容 + A5 5A
+        
+        Args:
+            timeout: 读取超时时间（秒）
+            
+        Returns:
+            bytes: 读取到的完整数据包，失败返回None
+        """
+        if not self.hmi or not self.hmi.is_connected():
+            return None
+            
+        try:
+            # 设置临时超时
+            original_timeout = self.hmi.ser.timeout
+            self.hmi.ser.timeout = timeout
+            
+            buffer = b''
+            max_length = 1024  # 最大数据包长度
+            start_found = False
+            
+            while len(buffer) < max_length:
+                byte = self.hmi.ser.read(1)
+                if not byte:
+                    break  # 超时或无数据
+                
+                buffer += byte
+                
+                # 查找开始符 0xAA
+                if not start_found:
+                    if byte == b'\xAA':
+                        start_found = True
+                        buffer = b'\xAA'  # 重置缓冲区，只保留开始符
+                    else:
+                        buffer = b''  # 清空缓冲区，继续寻找开始符
+                    continue
+                
+                # 已找到开始符，查找结束符 0xA5 0x5A
+                if len(buffer) >= 3 and buffer[-2:] == b'\xA5\x5A':
+                    # 找到完整的数据包
+                    self.hmi.ser.timeout = original_timeout
+                    return buffer
+            
+            # 恢复原始超时设置
+            self.hmi.ser.timeout = original_timeout
+            return None
+            
+        except Exception as e:
+            print(f"读取HMI指令数据包错误: {e}")
+            return None
+    
+    def parse_hmi_command_packet(self, packet):
+        """解析新格式的HMI指令数据包
+        
+        Args:
+            packet (bytes): 完整的数据包 (AA + 指令内容 + A5 5A)
+            
+        Returns:
+            str: 解析出的指令，失败返回None
+        """
+        if not packet or len(packet) < 4:
+            print("数据包太短或为空")
+            return None
+        
+        try:
+            # 显示原始数据包用于调试
+            hex_data = ' '.join([f'{b:02X}' for b in packet])
+            print(f"解析数据包: {hex_data}")
+            
+            # 验证数据包格式
+            if packet[0] != 0xAA:
+                print(f"开始符错误: 0x{packet[0]:02X}")
+                return None
+            
+            if packet[-2:] != b'\xA5\x5A':
+                print(f"结束符错误: {packet[-2:].hex()}")
+                return None
+            
+            # 提取指令内容（去除开始符和结束符）
+            command_bytes = packet[1:-2]
+            print(f"指令字节: {command_bytes}")
+            
+            # 解码指令内容
+            command = command_bytes.decode('utf-8', errors='ignore').strip()
+            print(f"解码后指令: '{command}' (长度: {len(command)})")
+            
+            return command if command else None
+                
+        except Exception as e:
+            print(f"解析HMI指令数据包错误: {e}")
+            return None
+
     def set_fix_gap(self, fix_gap):
         """设置是否修正误差"""
         self.fix_gap = fix_gap
@@ -212,21 +304,25 @@ class A4TrackingSystem:
         self.distance_calculator.update_distance_history(distance_mm)
         avg_distance = self.distance_calculator.get_averaged_distance()
         
+        # 检查HMI指令（无论是否开启fix_gap都要检查退出指令）
+        packet = self.read_hmi_command_packet(timeout=0)
+        if packet:
+            command = self.parse_hmi_command_packet(packet)
+            if command:
+                print(f"收到HMI指令: '{command}'")
+                
+                # 检查退出指令 (支持 'q', 'quit', 'exit')
+                if command.lower().strip() in ['q', 'quit', 'exit']:
+                    print("收到退出命令，程序即将退出...")
+                    return frame, None, None, "quit"
+        
         if self.fix_gap:
             # debug 时，使用串口，手动修正间隙
             global dx_from_uart, dy_from_uart
             
-            # 读取以0xA5 0x5A结束的数据包
-            packet = self.hmi.read_packet_with_terminator(timeout=0)
-            if packet:
-                result, message = self.hmi.parse_packet_data(packet)
-                print(f"收到数据包: {message}")
-                
-                if result == 'quit':
-                    print("收到退出命令，程序即将退出...")
-                    return frame, None, None, "quit"
-                
-                elif result == 'ok':
+            # 如果已经收到了指令，处理其他指令类型
+            if packet and command:
+                if command.lower().strip() == 'ok':
                     # 收集校准点数据
                     if distance_mm and len(self.calibration_points) < self.max_calibration_points:
                         # 将数据转换为整数并存储
@@ -243,12 +339,19 @@ class A4TrackingSystem:
                         else:
                             print(f"已收集足够的校准点({self.max_calibration_points}个)")
                 
-                elif isinstance(result, tuple):
-                    # 坐标数据
-                    x, y = result
-                    dx_from_uart = x
-                    dy_from_uart = y
-                    print(f"更新偏移量: dx={dx_from_uart}, dy={dy_from_uart}")
+                else:
+                    # 尝试解析为坐标数据 "x,y"
+                    try:
+                        if ',' in command:
+                            parts = command.strip().split(',')
+                            if len(parts) == 2:
+                                x = int(parts[0])
+                                y = int(parts[1])
+                                dx_from_uart = x
+                                dy_from_uart = y
+                                print(f"更新偏移量: dx={dx_from_uart}, dy={dy_from_uart}")
+                    except ValueError:
+                        print(f"无法解析坐标数据: '{command}'")
             
             offset_x, offset_y = dx_from_uart, dy_from_uart
         else:

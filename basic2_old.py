@@ -89,7 +89,7 @@ class DistanceOffsetCalculator:
     def calculate_screen_center_offset(self, distance_mm):
         """根据距离计算屏幕中心偏移量"""
         # 限制距离范围在500-1500mm之间
-        distance_mm = max(500, min(1500, distance_mm))
+        distance_mm = max(500, min(1800, distance_mm))
         
         # 使用多项式计算偏移量
         offset_x = np.polyval(self.poly_coeffs_x, distance_mm)
@@ -359,7 +359,7 @@ def main():
     
     print("=== 简化A4纸跟踪系统（固定参数+拟合偏移） ===")
     print("距离计算参数:", CAMERA_PARAMS)
-    print("距离范围: 500-1500mm")
+    # print("距离范围: 500-1500mm")
     print("\n操作:")
     print("- 'q': 退出程序")
     print("- 'h': 清除距离历史记录")

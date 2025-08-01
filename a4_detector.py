@@ -79,6 +79,88 @@ class A4PaperDetector:
         
         return mean_inner_val > config.MEAN_INNER_VAL and mean_border_val < config.MEAN_BORDER_VAL
     
+    def calculate_perspective_corrected_dimensions(self, detected_rect, frame_width, frame_height):
+        """计算透视校正后的A4纸尺寸"""
+        if detected_rect is None:
+            return None, None, None
+        
+        rect_pts = order_points(detected_rect.reshape(4, 2))
+        (tl, tr, br, bl) = rect_pts
+        
+        # 计算四条边的长度
+        width_top = np.sqrt(((tr[0] - tl[0]) ** 2) + ((tr[1] - tl[1]) ** 2))
+        width_bottom = np.sqrt(((br[0] - bl[0]) ** 2) + ((br[1] - bl[1]) ** 2))
+        height_left = np.sqrt(((bl[0] - tl[0]) ** 2) + ((bl[1] - tl[1]) ** 2))
+        height_right = np.sqrt(((br[0] - tr[0]) ** 2) + ((br[1] - tr[1]) ** 2))
+        
+        # 计算实际观测到的宽高
+        observed_width = (width_top + width_bottom) / 2
+        observed_height = (height_left + height_right) / 2
+        
+        # A4纸的标准宽高比 (210/297 ≈ 0.707)
+        standard_ratio = config.A4_WIDTH_MM / config.A4_HEIGHT_MM
+        observed_ratio = observed_width / observed_height
+        
+        # 透视校正策略：使用单应性变换计算真实尺寸
+        # 定义A4纸在标准位置的四个点
+        standard_width = 210  # 标准宽度，单位：像素（任意单位）
+        standard_height = 297  # 标准高度
+        
+        dst_points = np.array([
+            [0, 0],
+            [standard_width, 0],
+            [standard_width, standard_height],
+            [0, standard_height]
+        ], dtype=np.float32)
+        
+        # 计算单应性矩阵
+        homography = cv2.getPerspectiveTransform(rect_pts.astype(np.float32), dst_points)
+        
+        # 计算透视校正后的面积比例
+        # 原始四边形面积
+        original_area = cv2.contourArea(rect_pts)
+        # 标准四边形面积
+        standard_area = standard_width * standard_height
+        
+        # 面积缩放因子
+        area_scale = np.sqrt(original_area / standard_area)
+        
+        # 透视失真校正
+        # 计算透视变换的行列式，用于估计面积变化
+        det = np.linalg.det(homography[:2, :2])
+        perspective_scale = np.sqrt(abs(det)) if det != 0 else 1.0
+        
+        # 计算倾斜角度（基于矩形的变形程度）
+        width_diff = abs(width_top - width_bottom) / max(width_top, width_bottom)
+        height_diff = abs(height_left - height_right) / max(height_left, height_right)
+        
+        # 倾斜程度指标
+        tilt_factor = 1.0 + config.CAMERA_PARAMS.get("tilt_sensitivity", 0.5) * (width_diff + height_diff)
+        
+        # 最终校正
+        # 基于几何原理：当A4纸倾斜时，投影宽度会减小
+        # 校正因子应该根据观测比例与标准比例的偏差来调整
+        if observed_ratio > standard_ratio:
+            # 宽度相对过大，说明纸张向后倾斜（远端变窄）
+            correction_factor = standard_ratio / observed_ratio
+            corrected_width = observed_width * correction_factor * tilt_factor
+            corrected_height = observed_height
+        else:
+            # 高度相对过大，说明纸张左右倾斜
+            correction_factor = observed_ratio / standard_ratio
+            corrected_width = observed_width
+            corrected_height = observed_height * correction_factor * tilt_factor
+        
+        # 应用透视缩放校正
+        corrected_width *= perspective_scale
+        corrected_height *= perspective_scale
+        
+        # 计算A4纸中心点
+        center_x = (tl[0] + tr[0] + br[0] + bl[0]) / 4
+        center_y = (tl[1] + tr[1] + br[1] + bl[1]) / 4
+        
+        return corrected_width, corrected_height, (center_x, center_y)
+    
     def create_warped_image(self, frame, detected_rect):
         """创建透视变换后的图像"""
         if detected_rect is None:
@@ -189,7 +271,7 @@ class A4PaperDetector:
         
         # 可选：读取串口返回的数据
         if serial_controller.in_waiting() > 0:
-            response = serial_controller.read_line(timeout=0)
+            response = serial_controller.read_line(timeout=0.1)
             if response:
                 print(f"串口返回: {response}")
         

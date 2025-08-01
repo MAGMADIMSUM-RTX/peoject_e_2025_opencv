@@ -42,6 +42,25 @@ class DistanceOffsetCalculator:
         
         return int(round(offset_x)), int(round(offset_y))
     
+    def calculate_screen_center_offset_with_perspective_correction(self, distance_mm, tilt_angle_x=0, tilt_angle_y=0):
+        """考虑透视校正的屏幕中心偏移计算"""
+        # 基础偏移计算
+        base_offset_x, base_offset_y = self.calculate_screen_center_offset(distance_mm)
+        
+        # 透视校正系数
+        perspective_offset_factor_x = config.CAMERA_PARAMS.get("perspective_offset_factor_x", 1.0)
+        perspective_offset_factor_y = config.CAMERA_PARAMS.get("perspective_offset_factor_y", 1.0)
+        
+        # 应用倾斜角度校正（如果有倾斜角度信息）
+        tilt_correction_x = distance_mm * np.tan(np.radians(tilt_angle_x)) * config.CAMERA_PARAMS.get("tilt_correction_factor", 0.1)
+        tilt_correction_y = distance_mm * np.tan(np.radians(tilt_angle_y)) * config.CAMERA_PARAMS.get("tilt_correction_factor", 0.1)
+        
+        # 最终偏移量
+        final_offset_x = int(round(base_offset_x * perspective_offset_factor_x + tilt_correction_x))
+        final_offset_y = int(round(base_offset_y * perspective_offset_factor_y + tilt_correction_y))
+        
+        return final_offset_x, final_offset_y
+    
     def update_calibration_points(self, new_points):
         """更新校准点并重新拟合"""
         self.calibration_points = new_points

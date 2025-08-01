@@ -34,12 +34,12 @@ class DynamicConfig:
             
             # 串口配置
             "ENABLE_SERIAL": True,
-            "SERIAL_PORT": '/dev/serial/by-id/usb-ATK_ATK-HSWL-CMSIS-DAP_ATK_20190528-if00',
+            "SERIAL_PORT": '/dev/serial/by-id/usb-ATK_ATK-HSWL-CMSIS-DAP_ATK-ABE25C13-if00',
             "SERIAL_BAUDRATE": 115200,
             
             # HMI串口配置
             "ENABLE_HMI": True,
-            "HMI_PORT": '/dev/serial/by-id/usb-Arm_DAPLink_CMSIS-DAP_52D9DC36C41C91B341B13A63F8731D01-if01',
+            "HMI_PORT": '/dev/serial/by-id/usb-Arm_DAPLink_CMSIS-DAP_92B9DE0CD4FB882B9F36658BA81DFF1B-if01',
             "HMI_BAUDRATE": 115200,
             
             # 显示控制配置

@@ -38,6 +38,112 @@ class A4TrackingSystem:
         self.calibration_points = []  # 存储校准点 [distance_mm, offset_x, offset_y]
         self.max_calibration_points = 3  # 最大收集3个校准点
 
+    def read_hmi_command_packet(self, timeout=1.0):
+        """读取新格式的HMI指令数据包: AA + 指令内容 + A5 5A
+        
+        Args:
+            timeout: 读取超时时间（秒）
+            
+        Returns:
+            bytes: 读取到的完整数据包，失败返回None
+        """
+        if not self.hmi or not self.hmi.is_connected():
+            return None
+            
+        try:
+            # 设置临时超时
+            original_timeout = self.hmi.ser.timeout
+            self.hmi.ser.timeout = timeout
+            
+            buffer = b''
+            max_length = 1024  # 最大数据包长度
+            start_found = False
+            
+            while len(buffer) < max_length:
+                byte = self.hmi.ser.read(1)
+                if not byte:
+                    break  # 超时或无数据
+                
+                buffer += byte
+                
+                # 查找开始符 0xAA
+                if not start_found:
+                    if byte == b'\xAA':
+                        start_found = True
+                        buffer = b'\xAA'  # 重置缓冲区，只保留开始符
+                    else:
+                        buffer = b''  # 清空缓冲区，继续寻找开始符
+                    continue
+                
+                # 已找到开始符，查找结束符 0xA5 0x5A
+                if len(buffer) >= 3 and buffer[-2:] == b'\xA5\x5A':
+                    # 找到完整的数据包
+                    self.hmi.ser.timeout = original_timeout
+                    return buffer
+            
+            # 恢复原始超时设置
+            self.hmi.ser.timeout = original_timeout
+            return None
+            
+        except Exception as e:
+            print(f"读取HMI指令数据包错误: {e}")
+            return None
+    
+    def parse_hmi_command_packet(self, packet):
+        """解析新格式的HMI指令数据包
+        
+        Args:
+            packet (bytes): 完整的数据包 (AA + 指令内容 + A5 5A)
+            
+        Returns:
+            str or tuple: 解析出的指令字符串，或坐标元组(x, y)，失败返回None
+        """
+        if not packet or len(packet) < 4:
+            return None
+        
+        try:
+            # 验证数据包格式
+            if packet[0] != 0xAA:
+                return None
+            
+            if packet[-2:] != b'\xA5\x5A':
+                return None
+            
+            # 提取指令内容（去除开始符和结束符）
+            command_bytes = packet[1:-2]
+            
+            # 显示原始数据包用于调试
+            hex_data = ' '.join([f'{b:02X}' for b in packet])
+            print(f"解析数据包: {hex_data}")
+            
+            # 检查是否为二进制坐标格式 (长度为6: x(2字节) + 分隔符(1字节) + y(2字节) + 换行符(1字节))
+            if len(command_bytes) == 6 and command_bytes[2] == 0x2C and command_bytes[5] == 0x0A:
+                import struct
+                try:
+                    # 解析二进制坐标: 小端格式的有符号16位整数
+                    x = struct.unpack('<h', command_bytes[0:2])[0]  # 有符号16位小端
+                    y = struct.unpack('<h', command_bytes[3:5])[0]  # 有符号16位小端
+                    print(f"解析二进制坐标: x={x}, y={y}")
+                    return (x, y)
+                except struct.error as e:
+                    print(f"二进制坐标解析失败: {e}")
+            
+            # 尝试作为文本指令解析
+            try:
+                command = command_bytes.decode('utf-8', errors='ignore').strip()
+                if command:
+                    print(f"解析文本指令: '{command}'")
+                    return command
+            except UnicodeDecodeError:
+                pass
+            
+            print("未知数据包格式")
+            return None
+                
+        except Exception as e:
+            print(f"解析HMI指令数据包错误: {e}")
+            return None
+
     def set_fix_gap(self, fix_gap):
         """设置是否修正误差"""
         self.fix_gap = fix_gap
@@ -98,21 +204,35 @@ class A4TrackingSystem:
         self.distance_calculator.update_distance_history(distance_mm)
         avg_distance = self.distance_calculator.get_averaged_distance()
         
+        # 检查HMI指令（无论是否开启fix_gap都要检查退出指令）
+        command = None
+        packet = self.read_hmi_command_packet(timeout=0)
+        if packet:
+            command = self.parse_hmi_command_packet(packet)
+            if command:
+                # 检查是否为文本指令
+                if isinstance(command, str):
+                    print(f"收到HMI指令: '{command}'")
+                    
+                    if command.lower().strip() in ['q', 'quit', 'exit']:
+                        print("收到退出命令，程序即将退出...")
+                        return frame, None, None, "quit"
+                
+                # 检查是否为二进制坐标
+                elif isinstance(command, tuple):
+                    x, y = command
+                    print(f"收到二进制坐标: x={x}, y={y}")
+                    # 直接更新全局变量
+                    global dx_from_uart, dy_from_uart
+                    dx_from_uart = x
+                    dy_from_uart = y
+        
         if self.fix_gap:
             # debug 时，使用串口，手动修正间隙
-            global dx_from_uart, dy_from_uart
             
-            # 读取以0xA5 0x5A结束的数据包
-            packet = self.hmi.read_packet_with_terminator(timeout=0)
-            if packet:
-                result, message = self.hmi.parse_packet_data(packet)
-                print(f"收到数据包: {message}")
-                
-                if result == 'quit':
-                    print("收到退出命令，程序即将退出...")
-                    return frame, None, None, "quit"
-                
-                elif result == 'ok':
+            # 如果已经收到了文本指令，处理其他指令类型
+            if command and isinstance(command, str):
+                if command.lower().strip() == 'ok':
                     # 收集校准点数据
                     if distance_mm and len(self.calibration_points) < self.max_calibration_points:
                         # 将数据转换为整数并存储
@@ -129,12 +249,19 @@ class A4TrackingSystem:
                         else:
                             print(f"已收集足够的校准点({self.max_calibration_points}个)")
                 
-                elif isinstance(result, tuple):
-                    # 坐标数据
-                    x, y = result
-                    dx_from_uart = x
-                    dy_from_uart = y
-                    print(f"更新偏移量: dx={dx_from_uart}, dy={dy_from_uart}")
+                else:
+                    # 尝试解析为文本坐标数据 "x,y"
+                    try:
+                        if ',' in command:
+                            parts = command.strip().split(',')
+                            if len(parts) == 2:
+                                x = int(parts[0])
+                                y = int(parts[1])
+                                dx_from_uart = x
+                                dy_from_uart = y
+                                print(f"更新偏移量(文本): dx={dx_from_uart}, dy={dy_from_uart}")
+                    except ValueError:
+                        print(f"无法解析坐标数据: '{command}'")
             
             offset_x, offset_y = dx_from_uart, dy_from_uart
         else:

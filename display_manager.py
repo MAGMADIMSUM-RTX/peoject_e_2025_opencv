@@ -47,7 +47,7 @@ class DisplayManager:
         info_y = 30
         if distance_mm:
             cv2.putText(frame, f"Distance: {distance_mm:.1f}mm", (10, info_y),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
             info_y += 25
         
         if avg_distance:
