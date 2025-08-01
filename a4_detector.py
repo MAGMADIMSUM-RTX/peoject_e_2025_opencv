@@ -97,6 +97,11 @@ class A4PaperDetector:
         observed_width = (width_top + width_bottom) / 2
         observed_height = (height_left + height_right) / 2
         
+        # 防止除零错误：确保高度不为零
+        if observed_height <= 1e-8:
+            print("警告: 观测高度接近零，使用默认值")
+            observed_height = 1.0
+        
         # A4纸的标准宽高比 (210/297 ≈ 0.707)
         standard_ratio = config.A4_WIDTH_MM / config.A4_HEIGHT_MM
         observed_ratio = observed_width / observed_height
@@ -114,7 +119,12 @@ class A4PaperDetector:
         ], dtype=np.float32)
         
         # 计算单应性矩阵
-        homography = cv2.getPerspectiveTransform(rect_pts.astype(np.float32), dst_points)
+        try:
+            homography = cv2.getPerspectiveTransform(rect_pts.astype(np.float32), dst_points)
+        except cv2.error as e:
+            print(f"警告: 单应性变换计算失败: {e}")
+            # 使用默认值
+            homography = np.eye(3, dtype=np.float32)
         
         # 计算透视校正后的面积比例
         # 原始四边形面积
@@ -122,17 +132,26 @@ class A4PaperDetector:
         # 标准四边形面积
         standard_area = standard_width * standard_height
         
+        # 防止除零错误：确保标准面积不为零
+        if standard_area <= 1e-8:
+            print("警告: 标准面积接近零，使用默认值")
+            standard_area = 1.0
+        
         # 面积缩放因子
         area_scale = np.sqrt(original_area / standard_area)
         
         # 透视失真校正
         # 计算透视变换的行列式，用于估计面积变化
         det = np.linalg.det(homography[:2, :2])
-        perspective_scale = np.sqrt(abs(det)) if det != 0 else 1.0
+        perspective_scale = np.sqrt(abs(det)) if abs(det) > 1e-8 else 1.0
         
         # 计算倾斜角度（基于矩形的变形程度）
-        width_diff = abs(width_top - width_bottom) / max(width_top, width_bottom)
-        height_diff = abs(height_left - height_right) / max(height_left, height_right)
+        # 防止除零错误
+        width_max = max(width_top, width_bottom)
+        height_max = max(height_left, height_right)
+        
+        width_diff = abs(width_top - width_bottom) / width_max if width_max > 1e-8 else 0
+        height_diff = abs(height_left - height_right) / height_max if height_max > 1e-8 else 0
         
         # 倾斜程度指标
         tilt_factor = 1.0 + config.CAMERA_PARAMS.get("tilt_sensitivity", 0.5) * (width_diff + height_diff)
@@ -142,12 +161,12 @@ class A4PaperDetector:
         # 校正因子应该根据观测比例与标准比例的偏差来调整
         if observed_ratio > standard_ratio:
             # 宽度相对过大，说明纸张向后倾斜（远端变窄）
-            correction_factor = standard_ratio / observed_ratio
+            correction_factor = standard_ratio / observed_ratio if observed_ratio > 1e-8 else 1.0
             corrected_width = observed_width * correction_factor * tilt_factor
             corrected_height = observed_height
         else:
             # 高度相对过大，说明纸张左右倾斜
-            correction_factor = observed_ratio / standard_ratio
+            correction_factor = observed_ratio / standard_ratio if standard_ratio > 1e-8 else 1.0
             corrected_width = observed_width
             corrected_height = observed_height * correction_factor * tilt_factor
         
@@ -178,6 +197,11 @@ class A4PaperDetector:
         heightB = np.sqrt(((tl[0] - bl[0]) ** 2) + ((tl[1] - bl[1]) ** 2))
         detected_height = max(int(heightA), int(heightB))
         
+        # 防止除零错误：确保检测到的高度不为零
+        if detected_height <= 0:
+            print("警告: 检测到的高度为零，使用默认值")
+            detected_height = 1
+        
         # 计算目标尺寸
         aspect_ratio = 26.0 / 18.0
         
@@ -188,6 +212,10 @@ class A4PaperDetector:
             maxHeight = detected_height
             maxWidth = int(detected_height * aspect_ratio)
         
+        # 确保最小尺寸
+        maxWidth = max(maxWidth, 1)
+        maxHeight = max(maxHeight, 1)
+        
         # 透视变换
         dst = np.array([
             [0, 0],
@@ -195,8 +223,12 @@ class A4PaperDetector:
             [maxWidth - 1, maxHeight - 1],
             [0, maxHeight - 1]], dtype="float32")
         
-        M = cv2.getPerspectiveTransform(rect_pts, dst)
-        warped = cv2.warpPerspective(frame, M, (maxWidth, maxHeight))
+        try:
+            M = cv2.getPerspectiveTransform(rect_pts, dst)
+            warped = cv2.warpPerspective(frame, M, (maxWidth, maxHeight))
+        except cv2.error as e:
+            print(f"警告: 透视变换失败: {e}")
+            return None, None, None, None
         
         return warped, M, detected_width, (maxWidth, maxHeight)
     
@@ -205,8 +237,9 @@ class A4PaperDetector:
         maxWidth, maxHeight = warped.shape[1], warped.shape[0]
         
         # 计算像素/厘米比例
-        pixels_per_cm_w = maxWidth / config.PHYSICAL_WIDTH_CM
-        pixels_per_cm_h = maxHeight / config.PHYSICAL_HEIGHT_CM
+        # 防止除零错误
+        pixels_per_cm_w = maxWidth / config.PHYSICAL_WIDTH_CM if config.PHYSICAL_WIDTH_CM > 1e-8 else 1.0
+        pixels_per_cm_h = maxHeight / config.PHYSICAL_HEIGHT_CM if config.PHYSICAL_HEIGHT_CM > 1e-8 else 1.0
         pixels_per_cm = (pixels_per_cm_w + pixels_per_cm_h) / 2.0
         
         # 绘制圆形
@@ -215,7 +248,14 @@ class A4PaperDetector:
         cv2.circle(warped, center_px, radius_px, (255, 0, 0), 1)
         
         # 投影圆形到原图
-        inv_M = np.linalg.inv(M)
+        try:
+            inv_M = np.linalg.inv(M)
+        except np.linalg.LinAlgError:
+            print("警告: 矩阵不可逆，使用单位矩阵")
+            inv_M = np.eye(3, dtype=np.float32)
+            # 在这种情况下，直接返回变换图像的中心点
+            return center_px[0], center_px[1]
+        
         num_points = 100
         circle_points_warped = []
         for i in range(num_points):
@@ -225,8 +265,12 @@ class A4PaperDetector:
             circle_points_warped.append([x, y])
         
         circle_points_warped = np.array([circle_points_warped], dtype=np.float32)
-        original_circle_points = cv2.perspectiveTransform(circle_points_warped, inv_M)
-        cv2.polylines(frame, [np.int32(original_circle_points)], True, (255, 0, 0), 1)
+        
+        try:
+            original_circle_points = cv2.perspectiveTransform(circle_points_warped, inv_M)
+            cv2.polylines(frame, [np.int32(original_circle_points)], True, (255, 0, 0), 1)
+        except cv2.error as e:
+            print(f"警告: 透视变换圆形失败: {e}")
         
         # 计算中心点在原图中的位置
         center_warped_homogeneous = np.array([center_px[0], center_px[1], 1], dtype=np.float32)
@@ -257,7 +301,10 @@ class A4PaperDetector:
                     self.is_tracking = True
                     self.track_cnt = 0
                     time.sleep(0.001)
-                    serial_controller.write(b"1\n")
+                    try:
+                        serial_controller.write(b"1\n")
+                    except Exception as e:
+                        print(f"串口写入失败: {e}")
                     time.sleep(0.001)
             alignment_status = "Aligned"
         else:
@@ -267,13 +314,19 @@ class A4PaperDetector:
         
         # 发送偏移数据
         print(f"{-dx},{dy}")
-        serial_controller.write(f"{-dx},{dy}\n")
+        try:
+            serial_controller.write(f"{-dx},{dy}\n")
+        except Exception as e:
+            print(f"串口写入失败: {e}")
         
         # 可选：读取串口返回的数据
-        if serial_controller.in_waiting() > 0:
-            response = serial_controller.read_line(timeout=0.1)
-            if response:
-                print(f"串口返回: {response}")
+        try:
+            if serial_controller.in_waiting() > 0:
+                response = serial_controller.read_line(timeout=0.1)
+                if response:
+                    print(f"串口返回: {response}")
+        except Exception as e:
+            print(f"串口读取失败: {e}")
         
         self.last_dx = dx
         self.last_dy = dy
