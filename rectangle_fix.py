@@ -190,10 +190,10 @@ class A4DetectionTuner:
         """发送检测状态到HMI"""
         if detected != self.last_detection_status:
             if detected:
-                self.hmi.write(b't0.txt="Detected"\xff\xff\xff')
+                self.hmi.write(b't0.txt="检测到目标"\xff\xff\xff')
                 print("发送状态: 检测到目标")
             else:
-                self.hmi.write(b't0.txt="Undetected"\xff\xff\xff')
+                self.hmi.write(b't0.txt="未检测到"\xff\xff\xff')
                 print("发送状态: 未检测到")
             
             self.last_detection_status = detected
@@ -283,9 +283,9 @@ class A4DetectionTuner:
         cv2.putText(frame, hmi_status, (10, frame.shape[0] - 10), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, hmi_color, 2)
         
-        # 发送参数到串口（用于调试）
-        print(f"MEAN_INNER_VAL: {config.MEAN_INNER_VAL}, MEAN_BORDER_VAL: {config.MEAN_BORDER_VAL}")
-        self.serial_controller.write(f"{config.MEAN_INNER_VAL},{config.MEAN_BORDER_VAL}\n")
+        # 发送参数到串口（用于调试） - 已注释，避免干扰摄像头控制
+        # print(f"MEAN_INNER_VAL: {config.MEAN_INNER_VAL}, MEAN_BORDER_VAL: {config.MEAN_BORDER_VAL}")
+        # self.serial_controller.write(f"{config.MEAN_INNER_VAL},{config.MEAN_BORDER_VAL}\n")
         
         return frame, None
     
@@ -309,7 +309,7 @@ class A4DetectionTuner:
             print("\n运行在无头模式 - 使用 Ctrl+C 退出程序")
         
         # 初始化HMI显示
-        self.hmi.write(b't0.txt="running"\xff\xff\xff')
+        self.hmi.write(b't0.txt="参数调整模式"\xff\xff\xff')
         
         # 发送当前参数到HMI
         self.send_initial_parameters()
