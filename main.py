@@ -187,7 +187,7 @@ class MainController:
                 return None
             
             if packet[-2:] != b'\xA5\x5A':
-                print(f"错误: 数据包结束符不正确")
+                print("错误: 数据包结束符不正确")
                 return None
             
             # 提取指令内容（去除开始符和结束符）
@@ -332,6 +332,8 @@ class MainController:
         
         print(f"\n等待HMI串口指令... (端口: {config.HMI_PORT})")
         print("注意: 指令需要以换行符结尾")
+        self.hmi.write(b't0.txt="ready"\xff\xff\xff')
+        time.sleep(0.01)  # 等待HMI准备好
         
         try:
             while self.running:
@@ -359,6 +361,9 @@ class MainController:
                 elif command:
                     # 尝试执行脚本
                     print(f"\n准备执行: {command}")
+                    time.sleep(0.01)
+                    self.hmi.write(b't0.txt="waiting to start"\xff\xff\xff')
+                    time.sleep(0.01)
                     success = self.execute_script(command)
                     
                     if success:
@@ -367,6 +372,7 @@ class MainController:
                         print(f"\n脚本 '{command}' 执行失败，继续等待指令...")
                     
                     print("\n等待下一个指令...")
+                    self.hmi.write(b't0.txt="ready"\xff\xff\xff')
                 
         except KeyboardInterrupt:
             print("\n用户中断程序")

@@ -5,8 +5,6 @@
 """
 
 import cv2
-import time
-import numpy as np
 
 # 导入模块化组件
 from dynamic_config import config
@@ -31,7 +29,7 @@ class A4TrackingSystem:
         self.a4_detector = A4PaperDetector()
         self.display_manager = DisplayManager()
 
-        self.fix_gap = False
+        self.fix_gap = True
         
         # 摄像头
         self.cap = None
@@ -39,17 +37,6 @@ class A4TrackingSystem:
         # 校准点收集
         self.calibration_points = []  # 存储校准点 [distance_mm, offset_x, offset_y]
         self.max_calibration_points = 3  # 最大收集3个校准点
-        
-        # 未检测到矩形时的定时发送
-        self.last_no_detection_send_time = 0
-        self.no_detection_send_interval = 0.3  # 0.3秒间隔
-        
-        # 检测状态标记：一旦检测到矩形，永远保持检测状态
-        self.rect_detected_once = False
-        
-        # 用于处理检测失败时的距离计算
-        self.last_valid_distance = None
-        self.detection_failure_count = 0
 
     def read_hmi_command_packet(self, timeout=1.0):
         """读取新格式的HMI指令数据包: AA + 指令内容 + A5 5A
@@ -101,7 +88,7 @@ class A4TrackingSystem:
         except Exception as e:
             print(f"读取HMI指令数据包错误: {e}")
             return None
-
+    
     def parse_hmi_command_packet(self, packet):
         """解析新格式的HMI指令数据包
         
@@ -157,41 +144,6 @@ class A4TrackingSystem:
             print(f"解析HMI指令数据包错误: {e}")
             return None
 
-    def wait_for_start_command(self):
-        """等待HMI串口的start指令才开始运行"""
-        print("等待HMI串口start指令...")
-        print("期待指令: AA 73 74 61 72 74 0A A5 5A (start)")
-        
-        while True:
-            try:
-                # 持续读取HMI指令
-                packet = self.read_hmi_command_packet(timeout=1.0)
-                if packet:
-                    command = self.parse_hmi_command_packet(packet)
-                    if command and isinstance(command, str):
-                        print(f"收到HMI指令: '{command}'")
-                        
-                        # 检查是否为start指令
-                        if command.lower().strip() == 'start':
-                            print("收到start指令，开始运行A4跟踪系统...")
-                            self.hmi.write(b't0.txt="running"\xff\xff\xff')
-                            return True
-                        
-                        # 检查是否为退出指令
-                        if command.lower().strip() in ['q', 'quit', 'exit']:
-                            print("收到退出指令，程序退出")
-                            return False
-                
-                # 短暂延时避免CPU占用过高
-                time.sleep(0.1)
-                
-            except KeyboardInterrupt:
-                print("\n用户中断程序")
-                return False
-            except Exception as e:
-                print(f"等待start指令时出错: {e}")
-                time.sleep(1.0)
-
     def set_fix_gap(self, fix_gap):
         """设置是否修正误差"""
         self.fix_gap = fix_gap
@@ -230,110 +182,14 @@ class A4TrackingSystem:
         
         return True
     
-    def send_no_detection_signal(self):
-        """发送未检测到矩形的信号 (1200,0)"""
-        try:
-            # 构造文本格式数据包: "1000,0\n"
-            packet = b"900,0\n"
-            
-            # 发送到主串口
-            self.serial_controller.write(packet)
-            print(f"发送未检测信号: (1000, 0)")
-            
-        except Exception as e:
-            print(f"发送未检测信号失败: {e}")
-    
-    def process_frame_without_detection(self, frame, calculated_distance):
-        """处理检测失败时的帧，使用计算的距离"""
-        # 使用计算的距离更新距离历史
-        self.distance_calculator.update_distance_history(calculated_distance)
-        avg_distance = self.distance_calculator.get_averaged_distance()
-        
-        # 计算屏幕中心偏移
-        if avg_distance:
-            offset_x, offset_y = self.offset_calculator.calculate_screen_center_offset(avg_distance)
-        else:
-            offset_x, offset_y = 0, 0
-        
-        # 使用屏幕中心作为虚拟中心点
-        height, width = frame.shape[:2]
-        center_x = width // 2
-        center_y = height // 2
-        
-        # 计算动态屏幕中心
-        screen_center_x = width // 2 + offset_x
-        screen_center_y = height // 2 + offset_y
-        
-        # 计算偏移量（使用屏幕中心）
-        dx = center_x - screen_center_x
-        dy = center_y - screen_center_y
-        
-        # 发送坐标数据
-        print(f"{-dx},{dy}")
-        self.serial_controller.write(f"{-dx},{dy}\n")
-        
-        # 绘制信息（不绘制检测矩形）
-        self.display_manager.draw_screen_center(frame, screen_center_x, screen_center_y)
-        
-        # 绘制虚拟中心点
-        cv2.circle(frame, (center_x, center_y), 3, (255, 0, 255), -1)  # 紫色圆点
-        cv2.putText(frame, "Virtual Center", (center_x - 50, center_y - 20), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
-        
-        info_y = self.display_manager.draw_distance_info(frame, calculated_distance, avg_distance)
-        
-        # 显示检测失败信息
-        cv2.putText(frame, f"Detection Failed #{self.detection_failure_count}", 
-                   (10, info_y + 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-        cv2.putText(frame, f"Using calculated distance: {calculated_distance:.1f}mm", 
-                   (10, info_y + 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 255), 2)
-        
-        self.display_manager.draw_offset_info(frame, offset_x, offset_y, dx, dy, "Virtual", info_y + 60)
-        self.display_manager.draw_status_info(frame, self.serial_controller.is_connected())
-        
-        return frame, None, calculated_distance, avg_distance
-    
     def process_frame(self, frame):
         """处理单帧图像"""
-        # 如果已经检测到过矩形，直接使用最后检测到的矩形进行处理
-        if self.rect_detected_once:
-            # 尝试检测当前帧的矩形
-            detected_rect = self.a4_detector.detect_a4_paper(frame)
-            
-            # 如果当前帧检测到矩形，使用当前矩形
-            if detected_rect is not None:
-                # 重置失败计数
-                self.detection_failure_count = 0
-                return self.process_frame_with_detection(frame, detected_rect)
-            else:
-                # 如果当前帧没检测到，递增失败计数并使用计算的距离
-                self.detection_failure_count += 1
-                calculated_distance = self.last_valid_distance / (1 + self.detection_failure_count)
-                print(f"检测失败 #{self.detection_failure_count}，使用计算距离: {calculated_distance:.1f}mm")
-                return self.process_frame_without_detection(frame, calculated_distance)
-        
-        # 第一次检测逻辑
+        # 检测A4纸
         detected_rect = self.a4_detector.detect_a4_paper(frame)
         
-        # 如果没有检测到矩形，发送未检测信号
         if detected_rect is None:
-            current_time = time.time()
-            if current_time - self.last_no_detection_send_time >= self.no_detection_send_interval:
-                self.send_no_detection_signal()
-                self.last_no_detection_send_time = current_time
-            
             return frame, None, None, None
         
-        # 第一次检测到矩形，设置标记
-        self.rect_detected_once = True
-        self.detection_failure_count = 0
-        print("*** 首次检测到矩形，进入永久检测模式 ***")
-        
-        # 检测到矩形后，执行basic2.py的完整逻辑
-        return self.process_frame_with_detection(frame, detected_rect)
-    
-    def process_frame_with_detection(self, frame, detected_rect):
-        """检测到矩形后的完整处理逻辑（basic2.py的逻辑）"""
         # 创建透视变换图像
         warped_image, M, detected_width, warped_size = self.a4_detector.create_warped_image(frame, detected_rect)
         
@@ -345,11 +201,6 @@ class A4TrackingSystem:
         
         # 距离测量
         distance_mm = self.distance_calculator.calculate_distance_from_width(detected_width, frame.shape[1])
-        
-        # 保存有效距离
-        if distance_mm:
-            self.last_valid_distance = distance_mm
-        
         self.distance_calculator.update_distance_history(distance_mm)
         avg_distance = self.distance_calculator.get_averaged_distance()
         
@@ -447,13 +298,7 @@ class A4TrackingSystem:
         if not self.initialize_camera():
             return
         
-        # 等待HMI串口的start指令
-        if not self.wait_for_start_command():
-            print("未收到start指令，程序退出")
-            return
-        
-        print("=== 增强版A4纸跟踪系统 ===")
-        print("特性: 未检测到矩形时每0.3s发送(1000,0)信号")
+        print("=== 模块化A4纸跟踪系统 ===")
         print("距离计算参数:", config.CAMERA_PARAMS)
         print(f"距离范围: {config.MIN_DISTANCE_MM}-{config.MAX_DISTANCE_MM}mm")
         
@@ -465,6 +310,7 @@ class A4TrackingSystem:
         else:
             print("\n运行在无头模式 - 使用 Ctrl+C 退出程序")
         
+        self.hmi.write(b't0.txt="running"\xff\xff\xff')
         while True:
             ret, frame = self.cap.read()
             if not ret:
@@ -590,6 +436,7 @@ def main():
     
     # 运行系统
     try:
+        
         tracking_system.run()
     except KeyboardInterrupt:
         print("\n用户中断程序")

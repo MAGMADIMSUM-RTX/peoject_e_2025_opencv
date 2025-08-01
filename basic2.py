@@ -207,6 +207,9 @@ class A4TrackingSystem:
         # 检查HMI指令（无论是否开启fix_gap都要检查退出指令）
         command = None
         packet = self.read_hmi_command_packet(timeout=0)
+
+
+
         if packet:
             command = self.parse_hmi_command_packet(packet)
             if command:
@@ -293,9 +296,51 @@ class A4TrackingSystem:
         
         return frame, warped_image, distance_mm, avg_distance
     
+    def wait_for_start_command(self):
+        """等待HMI串口的start指令才开始运行"""
+        print("等待HMI串口start指令...")
+        print("期待指令: AA 73 74 61 72 74 0A A5 5A (start)")
+        
+        while True:
+            try:
+                # 持续读取HMI指令
+                packet = self.read_hmi_command_packet(timeout=1.0)
+                if packet:
+                    command = self.parse_hmi_command_packet(packet)
+                    if command and isinstance(command, str):
+                        print(f"收到HMI指令: '{command}'")
+                        
+                        # 检查是否为start指令
+                        if command.lower().strip() == 'start':
+                            print("收到start指令，开始运行A4跟踪系统...")
+                            self.hmi.write(b't0.txt="running"\xff\xff\xff')
+                            return True
+                        
+                        # 检查是否为退出指令
+                        if command.lower().strip() in ['q', 'quit', 'exit']:
+                            print("收到退出指令，程序退出")
+                            return False
+                
+                # 短暂延时避免CPU占用过高
+                import time
+                time.sleep(0.01)
+                
+            except KeyboardInterrupt:
+                print("\n用户中断程序")
+                return False
+            except Exception as e:
+                print(f"等待start指令时出错: {e}")
+                import time
+                time.sleep(0.1)
+
     def run(self):
         """运行主循环"""
         if not self.initialize_camera():
+            return
+        
+        # 等待HMI串口的start指令
+        if not self.wait_for_start_command():
+            print("未收到start指令，程序退出")
             return
         
         print("=== 模块化A4纸跟踪系统 ===")
