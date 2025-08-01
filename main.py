@@ -45,6 +45,61 @@ class MainController:
         print(f"\n收到信号 {signum}，正在退出...")
         self.running = False
     
+    def restart_program(self):
+        """重启程序"""
+        import os
+        import sys
+        
+        print("正在关闭HMI连接...")
+        if self.hmi:
+            self.hmi.close()
+        
+        print("正在重启程序...")
+        # 使用os.execv重新启动当前程序
+        # 保持相同的参数
+        python_executable = sys.executable
+        script_path = os.path.abspath(__file__)
+        
+        try:
+            # 使用os.execv替换当前进程
+            os.execv(python_executable, [python_executable, script_path] + sys.argv[1:])
+        except Exception as e:
+            print(f"重启失败: {e}")
+            # 如果execv失败，尝试使用subprocess
+            try:
+                import subprocess
+                subprocess.Popen([python_executable, script_path] + sys.argv[1:])
+                print("已启动新进程，当前进程即将退出...")
+            except Exception as e2:
+                print(f"启动新进程也失败: {e2}")
+    
+    def poweroff_system(self):
+        """关闭系统"""
+        import subprocess
+        
+        print("正在关闭HMI连接...")
+        if self.hmi:
+            self.hmi.close()
+        
+        print("正在执行系统关机命令...")
+        try:
+            # 执行 sudo poweroff 命令
+            result = subprocess.run(['sudo', 'poweroff'], check=False, timeout=10)
+            if result.returncode == 0:
+                print("关机命令执行成功")
+            else:
+                print(f"关机命令执行失败，返回码: {result.returncode}")
+        except subprocess.TimeoutExpired:
+            print("关机命令执行超时")
+        except Exception as e:
+            print(f"执行关机命令时出错: {e}")
+            # 如果 sudo poweroff 失败，尝试其他关机方法
+            try:
+                print("尝试使用 systemctl poweroff...")
+                subprocess.run(['systemctl', 'poweroff'], check=False, timeout=10)
+            except Exception as e2:
+                print(f"systemctl poweroff 也失败: {e2}")
+    
     def initialize_hmi(self):
         """初始化HMI串口连接"""
         print("初始化HMI串口连接...")
@@ -272,6 +327,8 @@ class MainController:
         print("=" * 60)
         print("支持的指令:")
         print("  help          - 显示此帮助信息")
+        print("  restart       - 重启程序")
+        print("  poweroff      - 关闭系统")
         print("  quit/exit     - 退出程序")
         print("  list          - 列出所有可用脚本")
         print("  status        - 显示系统状态")
@@ -334,6 +391,8 @@ class MainController:
         print("注意: 指令需要以换行符结尾")
         self.hmi.write(b't0.txt="ready"\xff\xff\xff')
         time.sleep(0.01)  # 等待HMI准备好
+        self.ser.write(b"2\n")
+
         
         try:
             while self.running:
@@ -352,7 +411,15 @@ class MainController:
                 #     print("收到退出指令，程序结束")
                 #     break
                 # elif command in ['help', 'h', '?']:
-                if command in ['help', 'h', '?']:
+                if command == 'restart':
+                    print("收到重启指令，正在重新启动程序...")
+                    self.restart_program()
+                    return 0  # 正常退出，让重启逻辑接管
+                elif command == 'poweroff':
+                    print("收到关机指令，正在关闭系统...")
+                    self.poweroff_system()
+                    return 0  # 正常退出
+                elif command in ['help', 'h', '?']:
                     self.show_help()
                 elif command in ['list', 'ls']:
                     self.list_scripts()
@@ -364,6 +431,8 @@ class MainController:
                     time.sleep(0.01)
                     self.hmi.write(b't0.txt="waiting to start"\xff\xff\xff')
                     time.sleep(0.01)
+                    self.ser.write(b"3\n") # 电机使能
+                    time.sleep(0.01)
                     success = self.execute_script(command)
                     
                     if success:
@@ -373,6 +442,11 @@ class MainController:
                     
                     print("\n等待下一个指令...")
                     self.hmi.write(b't0.txt="ready"\xff\xff\xff')
+                    time.sleep(0.01)
+                    self.ser.write(b"2\n") # 关激光
+                    time.sleep(0.01)
+                    self.ser.write(b"4\n") # 电机失能
+                    time.sleep(0.01)
                 
         except KeyboardInterrupt:
             print("\n用户中断程序")
