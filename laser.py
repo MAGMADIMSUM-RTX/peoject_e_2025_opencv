@@ -1,4 +1,608 @@
-# 切换到阶段2
+#!/usr/bin/env python3
+"""
+激光光斑跟踪系统
+基于basic2.py，添加蓝紫色激光光斑检测和跟踪功能
+分两阶段：1.视野中心对齐A4中心 2.激光光斑对齐A4中心
+"""
+
+import cv2
+import numpy as np
+import time
+
+# 导入模块化组件
+from dynamic_config import config
+from serial_controller import SerialController
+from distance_offset_calculator import DistanceOffsetCalculator
+from distance_calculator import SimpleDistanceCalculator
+from a4_detector import A4PaperDetector
+from display_manager import DisplayManager
+
+dx_from_uart = 0
+dy_from_uart = 0  # 用于从串口接收偏移量
+
+class LaserSpotDetector:
+    """激光光斑检测器"""
+    
+    def __init__(self):
+        # 基于测试数据的多组HSV范围（更鲁棒的检测）
+        self.hsv_ranges = [
+            # # 测试数据1: H(0-6) S(0-178) V(238-255) - 高亮度蓝紫色
+            # ([0, 0, 238], [6, 178, 255]),
+            # # 测试数据2: H(2-161) S(0-34) V(155-255) - 低饱和度高亮度
+            # ([2, 0, 155], [161, 34, 255]),
+            # # 测试数据3: H(12-122) S(0-241) V(215-255) - 宽色相范围
+            # ([12, 0, 215], [122, 241, 255]),
+            # # 测试数据4: H(15-121) S(0-230) V(192-255) - 中等亮度范围
+            # ([15, 0, 192], [121, 230, 255]),
+            ([0, 0, 255], [0, 0, 255]),
+        ]
+        
+        # 将HSV范围转换为numpy数组
+        self.hsv_ranges = [(np.array(lower), np.array(upper)) for lower, upper in self.hsv_ranges]
+        
+        # 额外的过曝白色光斑检测（作为备用）
+        self.lower_overexposed = np.array([0, 0, 245])  # 提高亮度阈值
+        self.higher_overexposed = np.array([180, 30, 255])  # 降低饱和度阈值
+        
+        # 光斑检测参数
+        self.min_area = 3          # 最小面积
+        self.max_area = 500        # 最大面积
+        self.min_circularity = 0.3  # 最小圆形度
+        
+        # 形态学操作核
+        self.kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        
+        # 调试模式：是否显示各个掩膜
+        self.debug_mode = False
+        
+        # 位置稳定性检查参数
+        self.last_position = None           # 上一帧的激光光斑位置 (x, y)
+        self.max_position_jump = 50         # 最大允许的位置跳跃像素数
+        self.position_history = []          # 位置历史记录
+        self.max_history_length = 5        # 最大历史记录长度
+        self.stability_threshold = 3        # 稳定性阈值：连续多少帧才认为位置稳定
+        self.lost_frames_count = 0          # 连续丢失帧数
+        self.max_lost_frames = 10           # 最大允许连续丢失帧数
+        
+        # 预测和平滑参数
+        self.use_prediction = True          # 是否使用位置预测
+        self.smoothing_factor = 0.7         # 位置平滑因子 (0-1, 越大越平滑)
+
+    def calculate_distance(self, pos1, pos2):
+        """计算两点之间的欧几里得距离"""
+        if pos1 is None or pos2 is None:
+            return float('inf')
+        return np.sqrt((pos1[0] - pos2[0])**2 + (pos1[1] - pos2[1])**2)
+    
+    def predict_next_position(self):
+        """基于历史位置预测下一个可能的位置"""
+        if len(self.position_history) < 2:
+            return self.last_position
+        
+        # 简单线性预测：基于最近两个位置的速度向量
+        if len(self.position_history) >= 2:
+            pos1 = self.position_history[-2]
+            pos2 = self.position_history[-1]
+            
+            # 计算速度向量
+            vx = pos2[0] - pos1[0]
+            vy = pos2[1] - pos1[1]
+            
+            # 预测下一个位置
+            predicted_x = pos2[0] + vx
+            predicted_y = pos2[1] + vy
+            
+            return (int(predicted_x), int(predicted_y))
+        
+        return self.last_position
+    
+    def update_position_history(self, position):
+        """更新位置历史记录"""
+        if position is not None:
+            self.position_history.append(position)
+            if len(self.position_history) > self.max_history_length:
+                self.position_history.pop(0)
+    
+    def smooth_position(self, new_position, last_position):
+        """位置平滑处理"""
+        if last_position is None:
+            return new_position
+        
+        # 加权平均平滑
+        smooth_x = int(self.smoothing_factor * last_position[0] + 
+                      (1 - self.smoothing_factor) * new_position[0])
+        smooth_y = int(self.smoothing_factor * last_position[1] + 
+                      (1 - self.smoothing_factor) * new_position[1])
+        
+        return (smooth_x, smooth_y)
+    
+    def validate_position_stability(self, detected_spots):
+        """验证位置稳定性并选择最佳候选位置"""
+        if not detected_spots:
+            # 没有检测到任何光斑
+            self.lost_frames_count += 1
+            
+            if self.lost_frames_count > self.max_lost_frames:
+                # 丢失太多帧，重置跟踪
+                self.reset_tracking()
+                return None
+            
+            # 使用预测位置或上一帧位置
+            if self.use_prediction and len(self.position_history) >= 2:
+                predicted_pos = self.predict_next_position()
+                print(f"激光光斑丢失，使用预测位置: {predicted_pos}")
+                return predicted_pos
+            elif self.last_position:
+                print(f"激光光斑丢失，使用上一帧位置: {self.last_position}")
+                return self.last_position
+            else:
+                return None
+        
+        # 有检测结果，重置丢失计数
+        self.lost_frames_count = 0
+        
+        if self.last_position is None:
+            # 第一次检测，直接使用最佳候选
+            best_spot = detected_spots[0]
+            position = (best_spot[0], best_spot[1])
+            self.last_position = position
+            self.update_position_history(position)
+            return position
+        
+        # 寻找与上一帧位置最接近的候选
+        best_candidate = None
+        min_distance = float('inf')
+        
+        for spot in detected_spots:
+            spot_pos = (spot[0], spot[1])
+            distance = self.calculate_distance(spot_pos, self.last_position)
+            
+            if distance < min_distance:
+                min_distance = distance
+                best_candidate = spot
+        
+        if best_candidate is None:
+            return self.last_position
+        
+        candidate_pos = (best_candidate[0], best_candidate[1])
+        
+        # 检查位置跳跃是否过大
+        if min_distance > self.max_position_jump:
+            print(f"检测到位置跳跃过大: {min_distance:.1f}px > {self.max_position_jump}px")
+            
+            # 如果有多个候选，尝试其他候选
+            if len(detected_spots) > 1:
+                for spot in detected_spots[1:]:
+                    spot_pos = (spot[0], spot[1])
+                    distance = self.calculate_distance(spot_pos, self.last_position)
+                    if distance <= self.max_position_jump:
+                        candidate_pos = spot_pos
+                        min_distance = distance
+                        best_candidate = spot
+                        print(f"使用备选候选，距离: {distance:.1f}px")
+                        break
+                else:
+                    # 所有候选都跳跃过大，使用预测或保持上一帧位置
+                    if self.use_prediction and len(self.position_history) >= 2:
+                        predicted_pos = self.predict_next_position()
+                        predicted_distance = self.calculate_distance(predicted_pos, self.last_position)
+                        if predicted_distance <= self.max_position_jump * 2:  # 放宽预测位置的限制
+                            print(f"使用预测位置，距离: {predicted_distance:.1f}px")
+                            return predicted_pos
+                    
+                    print("保持上一帧位置")
+                    return self.last_position
+        
+        # 应用位置平滑
+        smoothed_pos = self.smooth_position(candidate_pos, self.last_position)
+        
+        # 更新状态
+        self.last_position = smoothed_pos
+        self.update_position_history(smoothed_pos)
+        
+        return smoothed_pos
+    
+    def reset_tracking(self):
+        """重置跟踪状态"""
+        print("重置激光光斑跟踪状态")
+        self.last_position = None
+        self.position_history.clear()
+        self.lost_frames_count = 0
+    
+    def get_stability_info(self):
+        """获取稳定性相关信息"""
+        return {
+            'last_position': self.last_position,
+            'position_history_length': len(self.position_history),
+            'lost_frames_count': self.lost_frames_count,
+            'max_position_jump': self.max_position_jump,
+            'smoothing_factor': self.smoothing_factor
+        }
+    
+    def set_stability_parameters(self, max_jump=None, smoothing_factor=None, 
+                                max_lost_frames=None, use_prediction=None):
+        """设置稳定性参数"""
+        if max_jump is not None:
+            self.max_position_jump = max_jump
+        if smoothing_factor is not None:
+            self.smoothing_factor = max(0.0, min(1.0, smoothing_factor))
+        if max_lost_frames is not None:
+            self.max_lost_frames = max_lost_frames
+        if use_prediction is not None:
+            self.use_prediction = use_prediction
+
+    def detect_laser_spot(self, frame):
+        """检测激光光斑位置（使用多组HSV范围和稳定性检查）"""
+        # 转换到HSV色彩空间
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        
+        # 初始化组合掩膜
+        mask_combined = np.zeros(hsv.shape[:2], dtype=np.uint8)
+        
+        # 应用多组HSV范围检测
+        for i, (lower_hsv, upper_hsv) in enumerate(self.hsv_ranges):
+            mask = cv2.inRange(hsv, lower_hsv, upper_hsv)
+            mask_combined = cv2.bitwise_or(mask_combined, mask)
+            
+            if self.debug_mode:
+                cv2.imshow(f'Laser Mask {i+1}', mask)
+        
+        # 备用检测：过曝白色掩膜
+        mask_overexposed = cv2.inRange(hsv, self.lower_overexposed, self.higher_overexposed)
+        mask_combined = cv2.bitwise_or(mask_combined, mask_overexposed)
+        
+        if self.debug_mode:
+            cv2.imshow('Overexposed Mask', mask_overexposed)
+            cv2.imshow('Combined Laser Mask', mask_combined)
+        
+        # 形态学操作去噪
+        mask_combined = cv2.morphologyEx(mask_combined, cv2.MORPH_OPEN, self.kernel)
+        mask_combined = cv2.morphologyEx(mask_combined, cv2.MORPH_CLOSE, self.kernel)
+        
+        # 查找轮廓
+        contours, _ = cv2.findContours(mask_combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # 收集所有有效的候选光斑
+        candidate_spots = []
+        
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            
+            # 面积过滤
+            if area < self.min_area or area > self.max_area:
+                continue
+            
+            # 计算圆形度
+            perimeter = cv2.arcLength(contour, True)
+            if perimeter == 0:
+                continue
+            
+            circularity = 4 * np.pi * area / (perimeter * perimeter)
+            
+            if circularity < self.min_circularity:
+                continue
+            
+            # 计算质心
+            M = cv2.moments(contour)
+            if M["m00"] == 0:
+                continue
+            
+            cx = int(M["m10"] / M["m00"])
+            cy = int(M["m01"] / M["m00"])
+            
+            # 获取该点的HSV值用于验证
+            h, s, v = hsv[cy, cx]
+            
+            # 综合评分：面积适中，圆形度高，亮度高
+            area_score = min(area / 50.0, 1.0)  # 归一化面积权重
+            brightness_score = v / 255.0        # 亮度权重
+            score = circularity * area_score * brightness_score
+            
+            candidate_spots.append((cx, cy, area, circularity, h, s, v, score))
+        
+        # 按评分排序，获取最佳候选
+        candidate_spots.sort(key=lambda x: x[7], reverse=True)
+        
+        # 使用稳定性检查选择最终位置
+        stable_position = self.validate_position_stability(candidate_spots)
+        
+        if stable_position is None:
+            return None, mask_combined
+        
+        # 查找与稳定位置对应的光斑信息
+        best_spot_info = None
+        min_distance = float('inf')
+        
+        for spot in candidate_spots:
+            spot_pos = (spot[0], spot[1])
+            distance = self.calculate_distance(spot_pos, stable_position)
+            if distance < min_distance:
+                min_distance = distance
+                best_spot_info = spot[:7]  # 排除score
+        
+        # 如果没找到对应的光斑信息（使用预测位置的情况），创建一个基本信息
+        if best_spot_info is None:
+            # 使用稳定位置创建基本信息
+            h, s, v = hsv[stable_position[1], stable_position[0]]
+            best_spot_info = (stable_position[0], stable_position[1], 0, 0, h, s, v)
+        
+        return best_spot_info, mask_combined
+
+    def set_debug_mode(self, enable):
+        """设置调试模式"""
+        self.debug_mode = enable
+        if not enable:
+            # 关闭调试窗口
+            debug_windows = ['Laser Mask 1', 'Laser Mask 2', 'Laser Mask 3', 'Laser Mask 4', 
+                           'Overexposed Mask', 'Combined Laser Mask']
+            for window in debug_windows:
+                try:
+                    cv2.destroyWindow(window)
+                except:
+                    pass
+
+    def draw_laser_spot(self, frame, spot_info):
+        """在图像上绘制检测到的激光光斑"""
+        if spot_info is None:
+            return
+        
+        if len(spot_info) == 7:  # 新格式包含HSV信息
+            cx, cy, area, circularity, h, s, v = spot_info
+            
+            # 绘制光斑中心
+            cv2.circle(frame, (cx, cy), 5, (255, 0, 255), -1)  # 紫色实心圆
+            cv2.circle(frame, (cx, cy), 10, (255, 0, 255), 2)   # 紫色圆环
+            
+            # 绘制位置历史轨迹
+            if len(self.position_history) > 1:
+                points = np.array(self.position_history, dtype=np.int32)
+                cv2.polylines(frame, [points], False, (128, 0, 128), 2)
+            
+            # 添加标签和详细信息
+            cv2.putText(frame, f"Laser ({cx},{cy})", 
+                       (cx + 15, cy - 45), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
+            
+            # 显示光斑属性信息
+            if area > 0 and circularity > 0:  # 真实检测的光斑
+                cv2.putText(frame, f"Area: {area:.0f}", 
+                           (cx + 15, cy - 30), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
+                
+                cv2.putText(frame, f"Circ: {circularity:.2f}", 
+                           (cx + 15, cy - 15), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
+            else:  # 预测或保持的位置
+                cv2.putText(frame, "Predicted/Hold", 
+                           (cx + 15, cy - 30), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+            
+            # 显示HSV值
+            cv2.putText(frame, f"HSV: ({h},{s},{v})", 
+                       (cx + 15, cy), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
+            
+            # 显示稳定性信息
+            if self.lost_frames_count > 0:
+                cv2.putText(frame, f"Lost: {self.lost_frames_count}", 
+                           (cx + 15, cy + 15), 
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
+            
+            # 显示位置历史长度
+            cv2.putText(frame, f"History: {len(self.position_history)}", 
+                       (cx + 15, cy + 30), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+        
+        else:  # 兼容旧格式
+            cx, cy, area, circularity = spot_info
+            
+            # 绘制光斑中心
+            cv2.circle(frame, (cx, cy), 5, (255, 0, 255), -1)  # 紫色实心圆
+            cv2.circle(frame, (cx, cy), 10, (255, 0, 255), 2)   # 紫色圆环
+            
+            # 添加标签
+            cv2.putText(frame, f"Laser ({cx},{cy})", 
+                       (cx + 15, cy - 15), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
+            
+            # 显示光斑信息
+            cv2.putText(frame, f"Area: {area:.0f}", 
+                       (cx + 15, cy), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
+            
+            cv2.putText(frame, f"Circ: {circularity:.2f}", 
+                       (cx + 15, cy + 15), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
+
+class LaserTrackingSystem:
+    """激光光斑跟踪系统主类"""
+    
+    def __init__(self):
+        # 初始化所有组件
+        self.serial_controller = SerialController(config.SERIAL_PORT, config.SERIAL_BAUDRATE)
+        self.hmi = SerialController(config.HMI_PORT, config.HMI_BAUDRATE)
+        self.distance_calculator = SimpleDistanceCalculator()
+        self.offset_calculator = DistanceOffsetCalculator()
+        self.a4_detector = A4PaperDetector()
+        self.display_manager = DisplayManager()
+        self.laser_detector = LaserSpotDetector()  # 激光光斑检测器
+
+        self.fix_gap = False
+        
+        # 摄像头
+        self.cap = None
+        
+        # 校准点收集
+        self.calibration_points = []  # 存储校准点 [distance_mm, offset_x, offset_y]
+        self.max_calibration_points = 3  # 最大收集3个校准点
+        
+        # 跟踪状态和阶段控制
+        self.tracking_phase = "PHASE1"      # 当前跟踪阶段: PHASE1(视野中心对齐A4) 或 PHASE2(激光对齐A4)
+        self.target_center = None           # A4目标中心点
+        self.laser_center = None            # 激光光斑中心点
+        self.laser_opened = False           # 激光是否已开启
+        
+        # PHASE1相关参数 (与basic2相同)
+        self.phase1_is_tracking = False
+        self.phase1_track_cnt = 0
+        self.phase1_last_dx = 100
+        self.phase1_last_dy = 100
+        
+        # PHASE2相关参数 (激光光斑跟踪A4中心)
+        self.phase2_is_tracking = False
+        self.phase2_track_cnt = 0
+        self.phase2_last_dx = 100
+        self.phase2_last_dy = 100
+
+    def read_hmi_command_packet(self, timeout=1.0):
+        """读取新格式的HMI指令数据包: AA + 指令内容 + A5 5A"""
+        if not self.hmi or not self.hmi.is_connected():
+            return None
+            
+        try:
+            # 设置临时超时
+            original_timeout = self.hmi.ser.timeout
+            self.hmi.ser.timeout = timeout
+            
+            buffer = b''
+            max_length = 1024  # 最大数据包长度
+            start_found = False
+            
+            while len(buffer) < max_length:
+                byte = self.hmi.ser.read(1)
+                if not byte:
+                    break  # 超时或无数据
+                
+                buffer += byte
+                
+                # 查找开始符 0xAA
+                if not start_found:
+                    if byte == b'\xAA':
+                        start_found = True
+                        buffer = b'\xAA'  # 重置缓冲区，只保留开始符
+                    else:
+                        buffer = b''  # 清空缓冲区，继续寻找开始符
+                    continue
+                
+                # 已找到开始符，查找结束符 0xA5 0x5A
+                if len(buffer) >= 3 and buffer[-2:] == b'\xA5\x5A':
+                    # 找到完整的数据包
+                    self.hmi.ser.timeout = original_timeout
+                    return buffer
+            
+            # 恢复原始超时设置
+            self.hmi.ser.timeout = original_timeout
+            return None
+            
+        except Exception as e:
+            print(f"读取HMI指令数据包错误: {e}")
+            return None
+    
+    def parse_hmi_command_packet(self, packet):
+        """解析新格式的HMI指令数据包"""
+        if not packet or len(packet) < 4:
+            return None
+        
+        try:
+            # 验证数据包格式
+            if packet[0] != 0xAA:
+                return None
+            
+            if packet[-2:] != b'\xA5\x5A':
+                return None
+            
+            # 提取指令内容（去除开始符和结束符）
+            command_bytes = packet[1:-2]
+            
+            # 显示原始数据包用于调试
+            hex_data = ' '.join([f'{b:02X}' for b in packet])
+            print(f"解析数据包: {hex_data}")
+            
+            # 检查是否为二进制坐标格式 (长度为6: x(2字节) + 分隔符(1字节) + y(2字节) + 换行符(1字节))
+            if len(command_bytes) == 6 and command_bytes[2] == 0x2C and command_bytes[5] == 0x0A:
+                import struct
+                try:
+                    # 解析二进制坐标: 小端格式的有符号16位整数
+                    x = struct.unpack('<h', command_bytes[0:2])[0]  # 有符号16位小端
+                    y = struct.unpack('<h', command_bytes[3:5])[0]  # 有符号16位小端
+                    print(f"解析二进制坐标: x={x}, y={y}")
+                    return (x, y)
+                except struct.error as e:
+                    print(f"二进制坐标解析失败: {e}")
+            
+            # 尝试作为文本指令解析
+            try:
+                command = command_bytes.decode('utf-8', errors='ignore').strip()
+                if command:
+                    print(f"解析文本指令: '{command}'")
+                    return command
+            except UnicodeDecodeError:
+                pass
+            
+            print("未知数据包格式")
+            return None
+                
+        except Exception as e:
+            print(f"解析HMI指令数据包错误: {e}")
+            return None
+
+    def set_fix_gap(self, fix_gap):
+        """设置是否修正误差"""
+        self.fix_gap = fix_gap
+    
+    def update_calibration_points(self):
+        """更新配置文件中的校准点"""
+        try:
+            # 更新动态配置
+            config.CALIBRATION_POINTS = self.calibration_points.copy()
+            
+            # 保存到文件
+            config.save_to_file()
+            
+            print("=== 校准点更新完成 ===")
+            for i, point in enumerate(self.calibration_points, 1):
+                print(f"校准点{i}: 距离={point[0]}mm, 偏移=({point[1]}, {point[2]})")
+            
+            # 重新初始化偏移计算器以使用新的校准点
+            self.offset_calculator = DistanceOffsetCalculator()
+            print("偏移计算器已重新初始化")
+            
+            # 清空校准点列表，准备下一轮收集
+            self.calibration_points = []
+            print("校准点列表已清空，可以开始新一轮校准")
+            
+        except Exception as e:
+            print(f"更新校准点失败: {e}")
+    
+    def phase1_calculate_offset_and_check_alignment(self, center_x, center_y, screen_center_x, screen_center_y):
+        """阶段1：计算视野中心与A4中心的偏移量并检查对齐状态（基于basic2逻辑）"""
+        dx = center_x - screen_center_x
+        dy = center_y - screen_center_y
+        
+        # 检查对齐状态
+        if abs(dx) + abs(dy) < config.ALIGNMENT_THRESHOLD and abs(self.phase1_last_dx) + abs(self.phase1_last_dy) < config.ALIGNMENT_THRESHOLD:
+            if not self.phase1_is_tracking:
+                self.phase1_track_cnt += 1
+                if self.phase1_track_cnt > config.TRACK_COUNT_THRESHOLD:
+                    self.phase1_is_tracking = True
+                    self.phase1_track_cnt = 0
+                    
+                    # 阶段1对齐完成，开启激光并切换到阶段2
+                    print("=== 阶段1完成：视野中心与A4中心对齐 ===")
+                    print("开启激光，切换到阶段2：激光光斑对齐A4中心")
+                    time.sleep(0.001)
+                    
+                    # 发送激光开启信号
+                    if self.serial_controller.is_connected():
+                        try:
+                            print(f"[DEBUG] 发送对齐信号: 1")
+                            self.serial_controller.write(b"1\n")
+                        except Exception as e:
+                            print(f"串口写入失败: {e}")
+                    
+                    time.sleep(0.001)
+                    
+                    # 切换到阶段2
                     self.tracking_phase = "PHASE2"
                     self.laser_opened = True
                     
@@ -590,601 +1194,4 @@ def main():
         laser_tracking_system.cleanup()
 
 if __name__ == '__main__':
-    main()#!/usr/bin/env python3
-"""
-激光光斑跟踪系统
-基于basic2.py，添加蓝紫色激光光斑检测和跟踪功能
-分两阶段：1.视野中心对齐A4中心 2.激光光斑对齐A4中心
-"""
-
-import cv2
-import numpy as np
-import time
-
-# 导入模块化组件
-from dynamic_config import config
-from serial_controller import SerialController
-from distance_offset_calculator import DistanceOffsetCalculator
-from distance_calculator import SimpleDistanceCalculator
-from a4_detector import A4PaperDetector
-from display_manager import DisplayManager
-
-dx_from_uart = 0
-dy_from_uart = 0  # 用于从串口接收偏移量
-
-class LaserSpotDetector:
-    """激光光斑检测器"""
-    
-    def __init__(self):
-        # 基于测试数据的多组HSV范围（更鲁棒的检测）
-        self.hsv_ranges = [
-            # 测试数据1: H(0-6) S(0-178) V(238-255) - 高亮度蓝紫色
-            ([0, 0, 238], [6, 178, 255]),
-            # 测试数据2: H(2-161) S(0-34) V(155-255) - 低饱和度高亮度
-            ([2, 0, 155], [161, 34, 255]),
-            # 测试数据3: H(12-122) S(0-241) V(215-255) - 宽色相范围
-            ([12, 0, 215], [122, 241, 255]),
-            # 测试数据4: H(15-121) S(0-230) V(192-255) - 中等亮度范围
-            ([15, 0, 192], [121, 230, 255]),
-        ]
-        
-        # 将HSV范围转换为numpy数组
-        self.hsv_ranges = [(np.array(lower), np.array(upper)) for lower, upper in self.hsv_ranges]
-        
-        # 额外的过曝白色光斑检测（作为备用）
-        self.lower_overexposed = np.array([0, 0, 245])  # 提高亮度阈值
-        self.higher_overexposed = np.array([180, 30, 255])  # 降低饱和度阈值
-        
-        # 光斑检测参数
-        self.min_area = 3          # 最小面积
-        self.max_area = 500        # 最大面积
-        self.min_circularity = 0.3  # 最小圆形度
-        
-        # 形态学操作核
-        self.kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        
-        # 调试模式：是否显示各个掩膜
-        self.debug_mode = False
-        
-        # 位置稳定性检查参数
-        self.last_position = None           # 上一帧的激光光斑位置 (x, y)
-        self.max_position_jump = 50         # 最大允许的位置跳跃像素数
-        self.position_history = []          # 位置历史记录
-        self.max_history_length = 5        # 最大历史记录长度
-        self.stability_threshold = 3        # 稳定性阈值：连续多少帧才认为位置稳定
-        self.lost_frames_count = 0          # 连续丢失帧数
-        self.max_lost_frames = 10           # 最大允许连续丢失帧数
-        
-        # 预测和平滑参数
-        self.use_prediction = True          # 是否使用位置预测
-        self.smoothing_factor = 0.7         # 位置平滑因子 (0-1, 越大越平滑)
-
-    def calculate_distance(self, pos1, pos2):
-        """计算两点之间的欧几里得距离"""
-        if pos1 is None or pos2 is None:
-            return float('inf')
-        return np.sqrt((pos1[0] - pos2[0])**2 + (pos1[1] - pos2[1])**2)
-    
-    def predict_next_position(self):
-        """基于历史位置预测下一个可能的位置"""
-        if len(self.position_history) < 2:
-            return self.last_position
-        
-        # 简单线性预测：基于最近两个位置的速度向量
-        if len(self.position_history) >= 2:
-            pos1 = self.position_history[-2]
-            pos2 = self.position_history[-1]
-            
-            # 计算速度向量
-            vx = pos2[0] - pos1[0]
-            vy = pos2[1] - pos1[1]
-            
-            # 预测下一个位置
-            predicted_x = pos2[0] + vx
-            predicted_y = pos2[1] + vy
-            
-            return (int(predicted_x), int(predicted_y))
-        
-        return self.last_position
-    
-    def update_position_history(self, position):
-        """更新位置历史记录"""
-        if position is not None:
-            self.position_history.append(position)
-            if len(self.position_history) > self.max_history_length:
-                self.position_history.pop(0)
-    
-    def smooth_position(self, new_position, last_position):
-        """位置平滑处理"""
-        if last_position is None:
-            return new_position
-        
-        # 加权平均平滑
-        smooth_x = int(self.smoothing_factor * last_position[0] + 
-                      (1 - self.smoothing_factor) * new_position[0])
-        smooth_y = int(self.smoothing_factor * last_position[1] + 
-                      (1 - self.smoothing_factor) * new_position[1])
-        
-        return (smooth_x, smooth_y)
-    
-    def validate_position_stability(self, detected_spots):
-        """验证位置稳定性并选择最佳候选位置"""
-        if not detected_spots:
-            # 没有检测到任何光斑
-            self.lost_frames_count += 1
-            
-            if self.lost_frames_count > self.max_lost_frames:
-                # 丢失太多帧，重置跟踪
-                self.reset_tracking()
-                return None
-            
-            # 使用预测位置或上一帧位置
-            if self.use_prediction and len(self.position_history) >= 2:
-                predicted_pos = self.predict_next_position()
-                print(f"激光光斑丢失，使用预测位置: {predicted_pos}")
-                return predicted_pos
-            elif self.last_position:
-                print(f"激光光斑丢失，使用上一帧位置: {self.last_position}")
-                return self.last_position
-            else:
-                return None
-        
-        # 有检测结果，重置丢失计数
-        self.lost_frames_count = 0
-        
-        if self.last_position is None:
-            # 第一次检测，直接使用最佳候选
-            best_spot = detected_spots[0]
-            position = (best_spot[0], best_spot[1])
-            self.last_position = position
-            self.update_position_history(position)
-            return position
-        
-        # 寻找与上一帧位置最接近的候选
-        best_candidate = None
-        min_distance = float('inf')
-        
-        for spot in detected_spots:
-            spot_pos = (spot[0], spot[1])
-            distance = self.calculate_distance(spot_pos, self.last_position)
-            
-            if distance < min_distance:
-                min_distance = distance
-                best_candidate = spot
-        
-        if best_candidate is None:
-            return self.last_position
-        
-        candidate_pos = (best_candidate[0], best_candidate[1])
-        
-        # 检查位置跳跃是否过大
-        if min_distance > self.max_position_jump:
-            print(f"检测到位置跳跃过大: {min_distance:.1f}px > {self.max_position_jump}px")
-            
-            # 如果有多个候选，尝试其他候选
-            if len(detected_spots) > 1:
-                for spot in detected_spots[1:]:
-                    spot_pos = (spot[0], spot[1])
-                    distance = self.calculate_distance(spot_pos, self.last_position)
-                    if distance <= self.max_position_jump:
-                        candidate_pos = spot_pos
-                        min_distance = distance
-                        best_candidate = spot
-                        print(f"使用备选候选，距离: {distance:.1f}px")
-                        break
-                else:
-                    # 所有候选都跳跃过大，使用预测或保持上一帧位置
-                    if self.use_prediction and len(self.position_history) >= 2:
-                        predicted_pos = self.predict_next_position()
-                        predicted_distance = self.calculate_distance(predicted_pos, self.last_position)
-                        if predicted_distance <= self.max_position_jump * 2:  # 放宽预测位置的限制
-                            print(f"使用预测位置，距离: {predicted_distance:.1f}px")
-                            return predicted_pos
-                    
-                    print("保持上一帧位置")
-                    return self.last_position
-        
-        # 应用位置平滑
-        smoothed_pos = self.smooth_position(candidate_pos, self.last_position)
-        
-        # 更新状态
-        self.last_position = smoothed_pos
-        self.update_position_history(smoothed_pos)
-        
-        return smoothed_pos
-    
-    def reset_tracking(self):
-        """重置跟踪状态"""
-        print("重置激光光斑跟踪状态")
-        self.last_position = None
-        self.position_history.clear()
-        self.lost_frames_count = 0
-    
-    def get_stability_info(self):
-        """获取稳定性相关信息"""
-        return {
-            'last_position': self.last_position,
-            'position_history_length': len(self.position_history),
-            'lost_frames_count': self.lost_frames_count,
-            'max_position_jump': self.max_position_jump,
-            'smoothing_factor': self.smoothing_factor
-        }
-    
-    def set_stability_parameters(self, max_jump=None, smoothing_factor=None, 
-                                max_lost_frames=None, use_prediction=None):
-        """设置稳定性参数"""
-        if max_jump is not None:
-            self.max_position_jump = max_jump
-        if smoothing_factor is not None:
-            self.smoothing_factor = max(0.0, min(1.0, smoothing_factor))
-        if max_lost_frames is not None:
-            self.max_lost_frames = max_lost_frames
-        if use_prediction is not None:
-            self.use_prediction = use_prediction
-
-    def detect_laser_spot(self, frame):
-        """检测激光光斑位置（使用多组HSV范围和稳定性检查）"""
-        # 转换到HSV色彩空间
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-        
-        # 初始化组合掩膜
-        mask_combined = np.zeros(hsv.shape[:2], dtype=np.uint8)
-        
-        # 应用多组HSV范围检测
-        for i, (lower_hsv, upper_hsv) in enumerate(self.hsv_ranges):
-            mask = cv2.inRange(hsv, lower_hsv, upper_hsv)
-            mask_combined = cv2.bitwise_or(mask_combined, mask)
-            
-            if self.debug_mode:
-                cv2.imshow(f'Laser Mask {i+1}', mask)
-        
-        # 备用检测：过曝白色掩膜
-        mask_overexposed = cv2.inRange(hsv, self.lower_overexposed, self.higher_overexposed)
-        mask_combined = cv2.bitwise_or(mask_combined, mask_overexposed)
-        
-        if self.debug_mode:
-            cv2.imshow('Overexposed Mask', mask_overexposed)
-            cv2.imshow('Combined Laser Mask', mask_combined)
-        
-        # 形态学操作去噪
-        mask_combined = cv2.morphologyEx(mask_combined, cv2.MORPH_OPEN, self.kernel)
-        mask_combined = cv2.morphologyEx(mask_combined, cv2.MORPH_CLOSE, self.kernel)
-        
-        # 查找轮廓
-        contours, _ = cv2.findContours(mask_combined, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        # 收集所有有效的候选光斑
-        candidate_spots = []
-        
-        for contour in contours:
-            area = cv2.contourArea(contour)
-            
-            # 面积过滤
-            if area < self.min_area or area > self.max_area:
-                continue
-            
-            # 计算圆形度
-            perimeter = cv2.arcLength(contour, True)
-            if perimeter == 0:
-                continue
-            
-            circularity = 4 * np.pi * area / (perimeter * perimeter)
-            
-            if circularity < self.min_circularity:
-                continue
-            
-            # 计算质心
-            M = cv2.moments(contour)
-            if M["m00"] == 0:
-                continue
-            
-            cx = int(M["m10"] / M["m00"])
-            cy = int(M["m01"] / M["m00"])
-            
-            # 获取该点的HSV值用于验证
-            h, s, v = hsv[cy, cx]
-            
-            # 综合评分：面积适中，圆形度高，亮度高
-            area_score = min(area / 50.0, 1.0)  # 归一化面积权重
-            brightness_score = v / 255.0        # 亮度权重
-            score = circularity * area_score * brightness_score
-            
-            candidate_spots.append((cx, cy, area, circularity, h, s, v, score))
-        
-        # 按评分排序，获取最佳候选
-        candidate_spots.sort(key=lambda x: x[7], reverse=True)
-        
-        # 使用稳定性检查选择最终位置
-        stable_position = self.validate_position_stability(candidate_spots)
-        
-        if stable_position is None:
-            return None, mask_combined
-        
-        # 查找与稳定位置对应的光斑信息
-        best_spot_info = None
-        min_distance = float('inf')
-        
-        for spot in candidate_spots:
-            spot_pos = (spot[0], spot[1])
-            distance = self.calculate_distance(spot_pos, stable_position)
-            if distance < min_distance:
-                min_distance = distance
-                best_spot_info = spot[:7]  # 排除score
-        
-        # 如果没找到对应的光斑信息（使用预测位置的情况），创建一个基本信息
-        if best_spot_info is None:
-            # 使用稳定位置创建基本信息
-            h, s, v = hsv[stable_position[1], stable_position[0]]
-            best_spot_info = (stable_position[0], stable_position[1], 0, 0, h, s, v)
-        
-        return best_spot_info, mask_combined
-
-    def set_debug_mode(self, enable):
-        """设置调试模式"""
-        self.debug_mode = enable
-        if not enable:
-            # 关闭调试窗口
-            debug_windows = ['Laser Mask 1', 'Laser Mask 2', 'Laser Mask 3', 'Laser Mask 4', 
-                           'Overexposed Mask', 'Combined Laser Mask']
-            for window in debug_windows:
-                try:
-                    cv2.destroyWindow(window)
-                except:
-                    pass
-
-    def draw_laser_spot(self, frame, spot_info):
-        """在图像上绘制检测到的激光光斑"""
-        if spot_info is None:
-            return
-        
-        if len(spot_info) == 7:  # 新格式包含HSV信息
-            cx, cy, area, circularity, h, s, v = spot_info
-            
-            # 绘制光斑中心
-            cv2.circle(frame, (cx, cy), 5, (255, 0, 255), -1)  # 紫色实心圆
-            cv2.circle(frame, (cx, cy), 10, (255, 0, 255), 2)   # 紫色圆环
-            
-            # 绘制位置历史轨迹
-            if len(self.position_history) > 1:
-                points = np.array(self.position_history, dtype=np.int32)
-                cv2.polylines(frame, [points], False, (128, 0, 128), 2)
-            
-            # 添加标签和详细信息
-            cv2.putText(frame, f"Laser ({cx},{cy})", 
-                       (cx + 15, cy - 45), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
-            
-            # 显示光斑属性信息
-            if area > 0 and circularity > 0:  # 真实检测的光斑
-                cv2.putText(frame, f"Area: {area:.0f}", 
-                           (cx + 15, cy - 30), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
-                
-                cv2.putText(frame, f"Circ: {circularity:.2f}", 
-                           (cx + 15, cy - 15), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
-            else:  # 预测或保持的位置
-                cv2.putText(frame, "Predicted/Hold", 
-                           (cx + 15, cy - 30), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
-            
-            # 显示HSV值
-            cv2.putText(frame, f"HSV: ({h},{s},{v})", 
-                       (cx + 15, cy), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
-            
-            # 显示稳定性信息
-            if self.lost_frames_count > 0:
-                cv2.putText(frame, f"Lost: {self.lost_frames_count}", 
-                           (cx + 15, cy + 15), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1)
-            
-            # 显示位置历史长度
-            cv2.putText(frame, f"History: {len(self.position_history)}", 
-                       (cx + 15, cy + 30), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
-        
-        else:  # 兼容旧格式
-            cx, cy, area, circularity = spot_info
-            
-            # 绘制光斑中心
-            cv2.circle(frame, (cx, cy), 5, (255, 0, 255), -1)  # 紫色实心圆
-            cv2.circle(frame, (cx, cy), 10, (255, 0, 255), 2)   # 紫色圆环
-            
-            # 添加标签
-            cv2.putText(frame, f"Laser ({cx},{cy})", 
-                       (cx + 15, cy - 15), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 255), 1)
-            
-            # 显示光斑信息
-            cv2.putText(frame, f"Area: {area:.0f}", 
-                       (cx + 15, cy), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
-            
-            cv2.putText(frame, f"Circ: {circularity:.2f}", 
-                       (cx + 15, cy + 15), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 255), 1)
-
-class LaserTrackingSystem:
-    """激光光斑跟踪系统主类"""
-    
-    def __init__(self):
-        # 初始化所有组件
-        self.serial_controller = SerialController(config.SERIAL_PORT, config.SERIAL_BAUDRATE)
-        self.hmi = SerialController(config.HMI_PORT, config.HMI_BAUDRATE)
-        self.distance_calculator = SimpleDistanceCalculator()
-        self.offset_calculator = DistanceOffsetCalculator()
-        self.a4_detector = A4PaperDetector()
-        self.display_manager = DisplayManager()
-        self.laser_detector = LaserSpotDetector()  # 激光光斑检测器
-
-        self.fix_gap = False
-        
-        # 摄像头
-        self.cap = None
-        
-        # 校准点收集
-        self.calibration_points = []  # 存储校准点 [distance_mm, offset_x, offset_y]
-        self.max_calibration_points = 3  # 最大收集3个校准点
-        
-        # 跟踪状态和阶段控制
-        self.tracking_phase = "PHASE1"      # 当前跟踪阶段: PHASE1(视野中心对齐A4) 或 PHASE2(激光对齐A4)
-        self.target_center = None           # A4目标中心点
-        self.laser_center = None            # 激光光斑中心点
-        self.laser_opened = False           # 激光是否已开启
-        
-        # PHASE1相关参数 (与basic2相同)
-        self.phase1_is_tracking = False
-        self.phase1_track_cnt = 0
-        self.phase1_last_dx = 100
-        self.phase1_last_dy = 100
-        
-        # PHASE2相关参数 (激光光斑跟踪A4中心)
-        self.phase2_is_tracking = False
-        self.phase2_track_cnt = 0
-        self.phase2_last_dx = 100
-        self.phase2_last_dy = 100
-
-    def read_hmi_command_packet(self, timeout=1.0):
-        """读取新格式的HMI指令数据包: AA + 指令内容 + A5 5A"""
-        if not self.hmi or not self.hmi.is_connected():
-            return None
-            
-        try:
-            # 设置临时超时
-            original_timeout = self.hmi.ser.timeout
-            self.hmi.ser.timeout = timeout
-            
-            buffer = b''
-            max_length = 1024  # 最大数据包长度
-            start_found = False
-            
-            while len(buffer) < max_length:
-                byte = self.hmi.ser.read(1)
-                if not byte:
-                    break  # 超时或无数据
-                
-                buffer += byte
-                
-                # 查找开始符 0xAA
-                if not start_found:
-                    if byte == b'\xAA':
-                        start_found = True
-                        buffer = b'\xAA'  # 重置缓冲区，只保留开始符
-                    else:
-                        buffer = b''  # 清空缓冲区，继续寻找开始符
-                    continue
-                
-                # 已找到开始符，查找结束符 0xA5 0x5A
-                if len(buffer) >= 3 and buffer[-2:] == b'\xA5\x5A':
-                    # 找到完整的数据包
-                    self.hmi.ser.timeout = original_timeout
-                    return buffer
-            
-            # 恢复原始超时设置
-            self.hmi.ser.timeout = original_timeout
-            return None
-            
-        except Exception as e:
-            print(f"读取HMI指令数据包错误: {e}")
-            return None
-    
-    def parse_hmi_command_packet(self, packet):
-        """解析新格式的HMI指令数据包"""
-        if not packet or len(packet) < 4:
-            return None
-        
-        try:
-            # 验证数据包格式
-            if packet[0] != 0xAA:
-                return None
-            
-            if packet[-2:] != b'\xA5\x5A':
-                return None
-            
-            # 提取指令内容（去除开始符和结束符）
-            command_bytes = packet[1:-2]
-            
-            # 显示原始数据包用于调试
-            hex_data = ' '.join([f'{b:02X}' for b in packet])
-            print(f"解析数据包: {hex_data}")
-            
-            # 检查是否为二进制坐标格式 (长度为6: x(2字节) + 分隔符(1字节) + y(2字节) + 换行符(1字节))
-            if len(command_bytes) == 6 and command_bytes[2] == 0x2C and command_bytes[5] == 0x0A:
-                import struct
-                try:
-                    # 解析二进制坐标: 小端格式的有符号16位整数
-                    x = struct.unpack('<h', command_bytes[0:2])[0]  # 有符号16位小端
-                    y = struct.unpack('<h', command_bytes[3:5])[0]  # 有符号16位小端
-                    print(f"解析二进制坐标: x={x}, y={y}")
-                    return (x, y)
-                except struct.error as e:
-                    print(f"二进制坐标解析失败: {e}")
-            
-            # 尝试作为文本指令解析
-            try:
-                command = command_bytes.decode('utf-8', errors='ignore').strip()
-                if command:
-                    print(f"解析文本指令: '{command}'")
-                    return command
-            except UnicodeDecodeError:
-                pass
-            
-            print("未知数据包格式")
-            return None
-                
-        except Exception as e:
-            print(f"解析HMI指令数据包错误: {e}")
-            return None
-
-    def set_fix_gap(self, fix_gap):
-        """设置是否修正误差"""
-        self.fix_gap = fix_gap
-    
-    def update_calibration_points(self):
-        """更新配置文件中的校准点"""
-        try:
-            # 更新动态配置
-            config.CALIBRATION_POINTS = self.calibration_points.copy()
-            
-            # 保存到文件
-            config.save_to_file()
-            
-            print("=== 校准点更新完成 ===")
-            for i, point in enumerate(self.calibration_points, 1):
-                print(f"校准点{i}: 距离={point[0]}mm, 偏移=({point[1]}, {point[2]})")
-            
-            # 重新初始化偏移计算器以使用新的校准点
-            self.offset_calculator = DistanceOffsetCalculator()
-            print("偏移计算器已重新初始化")
-            
-            # 清空校准点列表，准备下一轮收集
-            self.calibration_points = []
-            print("校准点列表已清空，可以开始新一轮校准")
-            
-        except Exception as e:
-            print(f"更新校准点失败: {e}")
-    
-    def phase1_calculate_offset_and_check_alignment(self, center_x, center_y, screen_center_x, screen_center_y):
-        """阶段1：计算视野中心与A4中心的偏移量并检查对齐状态（基于basic2逻辑）"""
-        dx = center_x - screen_center_x
-        dy = center_y - screen_center_y
-        
-        # 检查对齐状态
-        if abs(dx) + abs(dy) < config.ALIGNMENT_THRESHOLD and abs(self.phase1_last_dx) + abs(self.phase1_last_dy) < config.ALIGNMENT_THRESHOLD:
-            if not self.phase1_is_tracking:
-                self.phase1_track_cnt += 1
-                if self.phase1_track_cnt > config.TRACK_COUNT_THRESHOLD:
-                    self.phase1_is_tracking = True
-                    self.phase1_track_cnt = 0
-                    
-                    # 阶段1对齐完成，开启激光并切换到阶段2
-                    print("=== 阶段1完成：视野中心与A4中心对齐 ===")
-                    print("开启激光，切换到阶段2：激光光斑对齐A4中心")
-                    time.sleep(0.001)
-                    self.serial_controller.write(b"1\n")  # 发送激光开启信号
-                    time.sleep(0.001)
-                    
-                    # 切换到阶段2
-                    self.tracking_phase = "PHASE2"
-                    self.laser_opened = True
+    main()
